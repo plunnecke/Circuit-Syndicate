@@ -18,9 +18,9 @@ uint32_t haptic_duties[NUM_HAPTICS] = {0, 0, 0, 0};
 
 // Sensor distance readings in feet
 // In manual mode set these values directly
-// In SIM_MODE 1 and 2 these are set automatically
+// In sim_modes these are set automatically, using core logic
 float S1 = 0.0;
-float S2 = 5.5;
+float S2 = 0.0;
 float S3 = 0.0;
 float S4 = 0.0;
 
@@ -190,7 +190,8 @@ void init_haptics() {
 // ============================================================
 
 void app_main(void) {
-    init_haptics();
+    init_haptics(); 
+    // init_haptics -> process_sensors -> check_process_pair -> get_tier -> get_duty -> set_haptic
 
     printf("\n==========================================\n");
     printf("   ESP32 HAPTIC VEST - BVI PROJECT\n");
