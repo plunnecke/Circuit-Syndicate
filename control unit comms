@@ -1,0 +1,260 @@
+#include "BluetoothSerial.h"
+
+BluetoothSerial SerialBT;
+
+const char* btName = "ESP32_DEVKITC";
+const char* btPin  = "1234";
+
+bool deviceConnected = false;
+bool awaitingGlassesResponse = false;
+
+enum PendingAction {
+  NONE,
+  TURN_SENSORS_OFF,
+  TURN_BOTH_OFF
+};
+
+PendingAction pendingAction = NONE;
+
+//Initialize pins
+#define BTN1_PIN  26   //Haptics button
+#define BTN2_PIN  27   //Sensors button
+#define BATTERY_MONITER_SCL 22
+#define BATTERY_MONITER_SDA 21
+
+#define MOSFET1_PIN 18   //Haptics LED
+#define MOSFET2_PIN 19   //Sensors LED (Was 19 for demo, change to 35 soon)
+
+#define MOSFET3_PIN 16
+#define MOSFET4_PIN 4
+
+//Sensors
+#define SENSOR_ADC_1 35
+#define SENSOR_ADC_2 34
+#define SENSOR_ADC_3 33
+#define SENSOR_ADC_4 32
+
+//Status
+bool hapticsOn = true;
+bool sensorsOn = true;
+bool glassesOn = false;
+
+//Time it takes for battery checks
+unsigned long lastBatteryCheck = 0;
+const unsigned long batteryInterval = 5000;
+
+//Setup
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(BTN1_PIN, INPUT_PULLUP);
+  pinMode(BTN2_PIN, INPUT_PULLUP);
+
+  pinMode(MOSFET1_PIN, OUTPUT);
+  pinMode(MOSFET2_PIN, OUTPUT);
+
+  updateLEDs(); //LEDs representing sensors and haptics are automatically on
+
+  if (!SerialBT.begin(btName)) {
+    Serial.println("Bluetooth init failed!");
+    while (true);
+  }
+
+  SerialBT.setPin(btPin, strlen(btPin));
+
+  Serial.println("Bluetooth ready, waiting for app...");
+}
+
+//LEDs
+void updateLEDs() {
+  digitalWrite(MOSFET1_PIN, hapticsOn ? HIGH : LOW);
+  digitalWrite(MOSFET2_PIN, sensorsOn ? HIGH : LOW);
+}
+
+//Battery
+int readBatteryPercent() {
+  int raw = analogRead(BATTERY_MONITER_SCL);
+  int percent = map(raw, 1800, 3000, 0, 100);
+  return constrain(percent, 0, 100);
+}
+
+//States
+void reportSystemState() {
+  if (hapticsOn && sensorsOn) {
+    SerialBT.println("BOTH_BUTTONS_ON");
+  }
+  else if (!hapticsOn && !sensorsOn) {
+    SerialBT.println("BOTH_BUTTONS_OFF");
+  }
+  else if (hapticsOn && !sensorsOn) {
+    SerialBT.println("HAPTICS_ON_SENSORS_OFF");
+  }
+  else {
+    SerialBT.println("HAPTICS_OFF_SENSORS_ON");
+  }
+}
+
+//Safety check
+void checkGlassesSafetyPrompt() {
+  if (digitalRead(BTN1_PIN) == LOW &&
+      digitalRead(BTN2_PIN) == LOW &&
+      !awaitingGlassesResponse) {
+
+    SerialBT.println("Are Glasses On?");
+    awaitingGlassesResponse = true;
+    delay(500);
+  }
+}
+
+void checkBluetoothSafetyResponse() {
+  if (!awaitingGlassesResponse || !SerialBT.available()) return;
+
+  String msg = SerialBT.readStringUntil('\n');
+  msg.trim();
+  msg.toLowerCase();
+
+  if (msg == "glasses are on") {
+
+    SerialBT.println("CONFIRMED: GLASSES ON");
+
+    if (pendingAction == TURN_SENSORS_OFF) {
+      sensorsOn = false;
+      SerialBT.println("SENSORS ARE NOW OFF");
+    }
+    else if (pendingAction == TURN_BOTH_OFF) {
+      sensorsOn = false;
+      hapticsOn = false;
+      SerialBT.println("HAPTICS ARE NOW OFF");
+      SerialBT.println("SENSORS ARE NOW OFF");
+    }
+
+    updateLEDs();
+    reportSystemState();
+
+    pendingAction = NONE;
+    awaitingGlassesResponse = false;
+  }
+  else if (msg == "glasses are off") {
+    SerialBT.println("TURN GLASSES ON");
+    pendingAction = NONE;
+    awaitingGlassesResponse = false;
+  }
+  else {
+    SerialBT.println("UNKNOWN RESPONSE");
+    SerialBT.println("TYPE: 'Glasses are on' OR 'Glasses are off'");
+  }
+}
+
+void requestGlassesConfirmation(PendingAction action) {
+  pendingAction = action;
+  awaitingGlassesResponse = true;
+  SerialBT.println("Are Glasses On?");
+}
+
+void loop() {
+
+  //Check BLE connection
+  if (SerialBT.hasClient()) {
+    if (!deviceConnected) {
+      deviceConnected = true;
+      Serial.println("Device Connected");
+      SerialBT.println("ESP_CONNECTED");
+    }
+  } else {
+    if (deviceConnected) {
+      deviceConnected = false;
+      Serial.println("Device Disconnected");
+    }
+    return;
+  }
+
+  //Check battery
+  if (millis() - lastBatteryCheck > batteryInterval) {
+    lastBatteryCheck = millis();
+
+    int battery = readBatteryPercent();
+    SerialBT.print("BATTERY:");
+    SerialBT.println(battery);
+
+    if (battery <= 5) {
+      SerialBT.println("BATTERY_CRITICAL: 5%");
+    }
+    else if (battery <= 10) {
+      SerialBT.println("BATTERY_LOW: 10%");
+    }
+    else if (battery <= 25) {
+      SerialBT.println("BATTERY_LOW: 25%");
+    }
+    else if (battery <= 50){
+      SerialBT.println("BATTERY_MEDIUM: 50%");
+    }
+    else if (battery <= 80){
+      SerialBT.println("BATTERY_HIGH: 80%");
+    }
+    else {
+      SerialBT.println("BATTERY_CHARGED, 100%");
+    }
+  }
+
+  //BLE commands
+  if (SerialBT.available() && !awaitingGlassesResponse) {
+
+    String cmd = SerialBT.readStringUntil('\n');
+    cmd.trim();
+    cmd.toUpperCase();
+
+    Serial.println("CMD: " + cmd);
+
+    if (cmd == "TURN HAPTICS ON") {
+      hapticsOn = true;
+    }
+    else if (cmd == "TURN HAPTICS OFF") {
+      hapticsOn = false;
+    }
+    else if (cmd == "TURN SENSORS ON") {
+      sensorsOn = true;
+    }
+    else if (cmd == "TURN SENSORS OFF") {
+      requestGlassesConfirmation(TURN_SENSORS_OFF);
+    }
+    else if (cmd == "TURN ALL OFF") {
+      requestGlassesConfirmation(TURN_BOTH_OFF);
+    }
+
+    updateLEDs();
+    reportSystemState();
+  }
+
+  //Buttons
+  if (!awaitingGlassesResponse) {
+
+    if (digitalRead(BTN1_PIN) == LOW) {
+      hapticsOn = !hapticsOn;
+      SerialBT.println(hapticsOn ? "HAPTICS:ON" : "HAPTICS:OFF");
+      updateLEDs();
+      reportSystemState();
+      delay(300);
+    }
+
+    if (digitalRead(BTN2_PIN) == LOW) {
+
+      if (sensorsOn) {
+    //Turning off that requires a safety check
+        requestGlassesConfirmation(TURN_SENSORS_OFF);
+      } 
+      
+      else {
+      sensorsOn = true;
+      SerialBT.println("SENSORS:ON");
+      updateLEDs();
+      reportSystemState();
+    }
+
+     delay(300);
+    }
+  }
+
+  checkGlassesSafetyPrompt();
+  checkBluetoothSafetyResponse();
+}
