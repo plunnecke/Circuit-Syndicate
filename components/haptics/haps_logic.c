@@ -4,21 +4,12 @@
 #include "haps_includes.h"
 #include "haps_config.h"
 
-
 // ============================================================
 //  [SETUP] GLOBAL VARIABLES
 // ============================================================
 
 // GPIO pins for each haptic motor
-int haptic_pins[NUM_HAPTICS] = {27, 14, 12, 13};
-
-// Sensor distance readings in feet
-// Rounded values: 0, 2, 3, 4, 5, or 6
-float S1 = 2.0;
-float S2 = 6.0;
-float S3 = 2.0;
-float S4 = 0.0;
-
+int haptic_pins[NUM_HAPTICS] = {18, 17, 16, 4};
 
 // ============================================================
 //  [CORE] TIER CALCULATION
@@ -35,7 +26,6 @@ int get_tier(float dist) {
     if (dist == 6.0) return 5;
     return 0;
 }
-
 
 // ============================================================
 //  PULSE DELAY CALCULATION
@@ -56,7 +46,6 @@ int get_off_delay(int tier) {
     return 0;
 }
 
-
 // ============================================================
 //  HAPTIC MOTOR CONTROL
 // ============================================================
@@ -65,7 +54,6 @@ void set_haptic(int motor, uint32_t duty) {
     ledc_set_duty(PWM_MODE, (ledc_channel_t)motor, duty);
     ledc_update_duty(PWM_MODE, (ledc_channel_t)motor);
 }
-
 
 // ============================================================
 //  HAPTIC TASK - H1
@@ -77,6 +65,11 @@ void haptic_task_1(void *pvParameters) {
     int tier;
     int off_delay;
     while (1) {
+        if (!haptics_On) {
+            set_haptic(0, 0);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
         tier = get_tier(S1);
         if (tier == 0) {
             set_haptic(0, 0);
@@ -91,7 +84,6 @@ void haptic_task_1(void *pvParameters) {
     }
 }
 
-
 // ============================================================
 //  [CORE] HAPTIC TASK - H2
 //  Reads S2, pulses H2 at rate determined by tier
@@ -102,6 +94,11 @@ void haptic_task_2(void *pvParameters) {
     int tier;
     int off_delay;
     while (1) {
+        if (!haptics_On) {
+            set_haptic(1, 0);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
         tier = get_tier(S2);
         if (tier == 0) {
             set_haptic(1, 0);
@@ -116,7 +113,6 @@ void haptic_task_2(void *pvParameters) {
     }
 }
 
-
 // ============================================================
 //  HAPTIC TASK - H3
 //  Reads S3, pulses H3 at rate determined by tier
@@ -127,6 +123,11 @@ void haptic_task_3(void *pvParameters) {
     int tier;
     int off_delay;
     while (1) {
+        if (!haptics_On) {
+            set_haptic(2, 0);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
         tier = get_tier(S3);
         if (tier == 0) {
             set_haptic(2, 0);
@@ -152,6 +153,11 @@ void haptic_task_4(void *pvParameters) {
     int tier;
     int off_delay;
     while (1) {
+        if (!haptics_On) {
+            set_haptic(3, 0);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
         tier = get_tier(S4);
         if (tier == 0) {
             set_haptic(3, 0);
@@ -199,10 +205,11 @@ void init_haptics() {
 
 
 // ============================================================
-//  MAIN ENTRY POINT
+//  MODULE ENTRY POINT
+//  Initializes haptic hardware, starts FreeRTOS tasks for each motor
 // ============================================================
 
-void app_main(void) {
+void boot_haps(void) {
     init_haptics();
 
     printf("\n==========================================\n");
