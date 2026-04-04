@@ -1,5 +1,5 @@
-static bool hapticsOn = true;
-static bool sensorsOn = true;
+bool hapticsOn = true;
+bool sensorsOn = true;
 static bool awaitingGlassesResponse = false;
 
 typedef enum {
@@ -11,8 +11,8 @@ typedef enum {
 static PendingAction pendingAction = NONE;
 
 // ===== BLE =====
-static uint16_t conn_handle;
-static uint16_t char_handle;
+uint16_t conn_handle;
+uint16_t char_handle;
 
 // ===== HELPERS =====
 void str_to_upper(char *s) {
@@ -37,15 +37,8 @@ void updateLEDs() {
     gpio_set_level(MOSFET2_PIN, sensorsOn);
 }
 
-int readBatteryPercent() {
-    int raw = adc1_get_raw(BATTERY_ADC_CHANNEL);
-    int percent = (raw - 1800) * 100 / (3000 - 1800);
-
-    if (percent < 0) percent = 0;
-    if (percent > 100) percent = 100;
-
-    return percent;
-}
+// calling battery reading from non_visual
+extern float battery_percentage;
 
 // ===== BLE SEND =====
 void ble_send(const char *msg) {
@@ -199,8 +192,8 @@ void ble_host_task(void *param) {
     nimble_port_run();
 }
 
-// ===== INIT =====
-void app_main(void) {
+// ===== HARDWARE INITIALIZATION =====
+void init_bt(void) {
 
     ESP_ERROR_CHECK(nvs_flash_init());
 
@@ -211,25 +204,20 @@ void app_main(void) {
     gpio_set_direction(BTN1_PIN, GPIO_MODE_INPUT);
     gpio_set_direction(BTN2_PIN, GPIO_MODE_INPUT);
 
-    // ADC
-    adc1_config_width(ADC_WIDTH_BIT_12);
-    adc1_config_channel_atten(BATTERY_ADC_CHANNEL, ADC_ATTEN_DB_11);
-
     updateLEDs();
 
     // BLE
     nimble_port_init();
     ble_svc_gap_init();
     ble_svc_gatt_init();
-
     ble_gatts_count_cfg(gatt_svcs);
     ble_gatts_add_svcs(gatt_svcs);
-
     ble_hs_cfg.sync_cb = ble_app_on_sync;
-
     nimble_port_freertos_init(ble_host_task);
+}
 
-    // MAIN LOOP TASK
+    // ==== BT COMMS TASK ====
+void bt_comms_task(void *pvParameters) {
     while (1) {
 
         // Button 1
@@ -261,12 +249,21 @@ void app_main(void) {
         if (now - last > 5000) {
             last = now;
 
-            int battery = readBatteryPercent();
             char msg[50];
-            sprintf(msg, "BATTERY:%d", battery);
+            sprintf(msg, "BATTERY:%d", (int)battery_percentage);
             ble_send(msg);
         }
 
         vTaskDelay(pdMS_TO_TICKS(50));
     }
+}
+
+// ============================================================
+//  MODULE ENTRY POINT
+//  Initializes hardware and launches bt_comms task
+// ============================================================
+
+void boot_bt(void) {
+    init_bt();
+    xTaskCreate(bt_comms_task, "bt_comms_task", 4096, NULL, 5, NULL);
 }
