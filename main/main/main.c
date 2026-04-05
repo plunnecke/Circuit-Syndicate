@@ -1,6 +1,21 @@
 #include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
-void app_main(void)
-{
+// Module boot declarations
+void boot_bt(void);
+void boot_haps(void);
+void boot_bt(void);
+
+void app_main(void) {
+    printf("\n===========================\n");
+    printf("  BVI ENMASSE - SYSTEM STARTUP\n");
+    printf("=============================\n\n");
+
+    boot_nv();
+    boot_haps();
+    boot_bt();
+
+    print("All modules initialized.\n");    
 
 }
