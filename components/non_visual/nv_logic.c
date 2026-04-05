@@ -17,6 +17,9 @@ float S2 = 0.0f;
 float S3 = 0.0f;
 float S4 = 0.0f;
 
+// Shared battery percentage - read by bt_comms
+float battery_percentage = 0.0f;
+
 i2c_master_dev_handle_t dev_handle;
 
 // Controlled by bt_comms
@@ -111,7 +114,6 @@ void non_visual_task(void *pvParameters) {
 
         // Battery read
         uint16_t soc_raw = 0;
-        float battery_percentage = 0.0f;
         if (max17048_read_reg(MAX17048_SOC_REG, &soc_raw) == ESP_OK)
             battery_percentage = soc_raw / 256.0f;
 

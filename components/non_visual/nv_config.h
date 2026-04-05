@@ -46,6 +46,9 @@ typedef struct {
 // Shared sensor globals (written by non_visual, read by haptics)
 extern float S1, S2, S3, S4;
 
+// Shared battery percentage (written by non_visual, read by bt_comms)
+extern float battery_percentage;
+
 // I2C device handle (used in nv_logic.c)
 extern i2c_master_dev_handle_t dev_handle;
 

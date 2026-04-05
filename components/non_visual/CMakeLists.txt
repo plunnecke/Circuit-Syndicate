@@ -6,5 +6,4 @@ idf_component_register(
         driver
         esp_adc
         esp_timer
-        esp_log
 )

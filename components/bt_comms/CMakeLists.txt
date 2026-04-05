@@ -3,11 +3,9 @@ idf_component_register(
     INCLUDE_DIRS "."           
     REQUIRES
         freertos
-        nimble
         driver
         esp_adc
         esp_timer
-        esp_log
         nvs_flash
         bt
 )
