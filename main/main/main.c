@@ -3,7 +3,7 @@
 #include "freertos/task.h"
 
 // Module boot declarations
-void boot_bt(void);
+void boot_nv(void);
 void boot_haps(void);
 void boot_bt(void);
 
@@ -16,6 +16,6 @@ void app_main(void) {
     boot_haps();
     boot_bt();
 
-    print("All modules initialized.\n");    
+    printf("All modules initialized.\n");    
 
 }

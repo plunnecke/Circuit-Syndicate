@@ -65,7 +65,7 @@ void haptic_task_1(void *pvParameters) {
     int tier;
     int off_delay;
     while (1) {
-        if (!haptics_On) {
+        if (!hapticsOn) {
             set_haptic(0, 0);
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
@@ -94,7 +94,7 @@ void haptic_task_2(void *pvParameters) {
     int tier;
     int off_delay;
     while (1) {
-        if (!haptics_On) {
+        if (!hapticsOn) {
             set_haptic(1, 0);
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
@@ -123,7 +123,7 @@ void haptic_task_3(void *pvParameters) {
     int tier;
     int off_delay;
     while (1) {
-        if (!haptics_On) {
+        if (!hapticsOn) {
             set_haptic(2, 0);
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
@@ -153,7 +153,7 @@ void haptic_task_4(void *pvParameters) {
     int tier;
     int off_delay;
     while (1) {
-        if (!haptics_On) {
+        if (!hapticsOn) {
             set_haptic(3, 0);
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;

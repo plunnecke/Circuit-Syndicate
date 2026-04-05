@@ -1,3 +1,6 @@
+#include "bt_includes.h"
+#include "bt_config.h"
+
 bool hapticsOn = true;
 bool sensorsOn = true;
 static bool awaitingGlassesResponse = false;
@@ -25,9 +28,9 @@ void str_to_lower(char *s) {
 
 void str_trim(char *s) {
     char *end;
-    while (isspace(*s)) s++;
+    while (isspace((unsigned char)*s)) s++;
     end = s + strlen(s) - 1;
-    while (end > s && isspace(*end)) end--;
+    while (end > s && isspace((unsigned char)*end)) end--;
     *(end + 1) = '\0';
 }
 

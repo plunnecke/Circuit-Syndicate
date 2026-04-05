@@ -21,7 +21,7 @@ extern int haptic_pins[NUM_HAPTICS];
 extern float S1, S2, S3, S4;
 
 // Controlled by bt_comms
-extern bool haptics_On;
+extern bool hapticsOn;
 
 // Function declarations
 void init_haptics(void);
