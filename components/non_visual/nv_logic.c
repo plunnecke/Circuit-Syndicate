@@ -11,13 +11,17 @@
 //  GLOBALS
 // ============================================================
 
-// Shared sensor values - read by haptics module
+// Sensor distances in feet - updated each loop, read by haptics
 float S1 = 0.0f;
 float S2 = 0.0f;
 float S3 = 0.0f;
 float S4 = 0.0f;
 
-// Shared battery percentage - read by bt_comms
+// Internal sensor state
+static sensor_t sensors[NUM_SENSORS];
+static adc_oneshot_unit_handle_t adc_handle;
+
+// Battery % from MAX17048 - sent to app via bt_comms every 5s
 float battery_percentage = 0.0f;
 
 i2c_master_dev_handle_t dev_handle;
@@ -55,9 +59,6 @@ esp_err_t max17048_read_reg(uint8_t reg_addr, uint16_t *reg_data) {
 //  SENSOR TASK
 //  Runs continuously, updates S1-S4 shared globals
 // ============================================================
-
-static sensor_t sensors[NUM_SENSORS];
-static adc_oneshot_unit_handle_t adc_handle;
 
 void non_visual_task(void *pvParameters) {
     while (1) {

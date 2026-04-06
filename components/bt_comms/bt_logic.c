@@ -182,7 +182,8 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
 
 // ===== BLE INIT =====
 void ble_app_on_sync(void) {
-    ble_hs_id_infer_auto(0, NULL);
+    uint8_t own_addr_type;
+    ble_hs_id_infer_auto(0, &own_addr_type);
 
     struct ble_gap_adv_params adv_params = {0};
 
