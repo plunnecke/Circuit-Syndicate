@@ -76,7 +76,7 @@ void non_visual_task(void *pvParameters) {
 
         // Read each sensor
         for (int i = 0; i < NUM_SENSORS; i++) {
-            vTaskDelay(pdMS_TO_TICKS(20));
+            vTaskDelay(pdMS_TO_TICKS(10));
 
             int raw = 0, mv = 0;
             if (adc_oneshot_read(adc_handle, sensors[i].channel, &raw) == ESP_OK) {
@@ -122,7 +122,7 @@ void non_visual_task(void *pvParameters) {
                S1, S2, S3, S4, battery_percentage);
         fflush(stdout);
 
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
