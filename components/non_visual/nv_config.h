@@ -32,6 +32,9 @@
 #define Sensor3 sensors[2].result_ft
 #define Sensor4 sensors[3].result_ft
 
+// No reading threshold (in feet)
+#define NO_READING 0.001f
+
 // Sensor structure
 typedef struct {
     adc_channel_t       channel;
@@ -48,6 +51,9 @@ extern float S1, S2, S3, S4;
 
 // Shared battery percentage (written by non_visual, read by bt_comms)
 extern float battery_percentage;
+
+// Object detection flag (true if any sensor detects an object within range)
+extern bool object_detected;
 
 // I2C device handle (used in nv_logic.c)
 extern i2c_master_dev_handle_t dev_handle;

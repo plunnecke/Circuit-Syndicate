@@ -4,6 +4,7 @@
 bool hapticsOn = true;
 bool sensorsOn = true;
 static bool awaitingGlassesResponse = false;
+extern bool object_detected; // from nv_logic.c
 
 typedef enum {
     NONE,
@@ -256,6 +257,17 @@ void bt_comms_task(void *pvParameters) {
             char msg[50];
             sprintf(msg, "BATTERY:%d", (int)battery_percentage);
             ble_send(msg);
+        }
+
+        // Glasses capture with 3s cooldown to prevent spamming
+         static int64_t lastGlassesCapture = 0;
+        int64_t nowGlassesCapture = esp_timer_get_time() / 1000;
+
+        if (nowGlassesCapture - lastGlassesCapture > 3000) {
+            lastGlassesCapture = nowGlassesCapture;
+                if (object_detected) {
+                    ble_send("GLASSES_CAPTURE");
+                }
         }
 
         vTaskDelay(pdMS_TO_TICKS(50));

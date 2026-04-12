@@ -17,6 +17,9 @@ float S2 = 0.0f;
 float S3 = 0.0f;
 float S4 = 0.0f;
 
+// Object detection flag (true if any sensor detects an object within range)
+bool object_detected = false;
+
 // Internal sensor state
 static sensor_t sensors[NUM_SENSORS];
 static adc_oneshot_unit_handle_t adc_handle;
@@ -112,6 +115,9 @@ void non_visual_task(void *pvParameters) {
         S2 = sensors[1].result_ft;
         S3 = sensors[2].result_ft;
         S4 = sensors[3].result_ft;
+
+        // Update object detection flag 
+        object_detected = (S1 > NO_READING) || (S2 > NO_READING) || (S3 > NO_READING) || (S4 > NO_READING);
 
         // Battery read
         uint16_t soc_raw = 0;
