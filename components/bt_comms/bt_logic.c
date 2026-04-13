@@ -225,28 +225,28 @@ void init_bt(void) {
 void bt_comms_task(void *pvParameters) {
     while (1) {
 
-        // Button 1
-        if (gpio_get_level(BTN1_PIN) == 0) {
-            hapticsOn = !hapticsOn;
+        // Switch 1 - haptics
+        bool switch1 = gpio_get_level(BTN1_PIN);
+        if (switch1 != hapticsOn) {
+            hapticsOn = switch1;
             ble_send(hapticsOn ? "HAPTICS ON" : "HAPTICS OFF");
             updateLEDs();
             reportSystemState();
-            vTaskDelay(pdMS_TO_TICKS(300));
         }
 
-        // Button 2
-        if (gpio_get_level(BTN2_PIN) == 0) {
-            if (sensorsOn) {
+        // Switch 2 - sensors
+        bool switch2 = gpio_get_level(BTN2_PIN);
+        if (switch2 != sensorsOn) {
+            if (!switch2) {
                 requestGlassesConfirmation(TURN_SENSORS_OFF);
             } else {
-                sensorsOn = true;
-                ble_send("SENSORS ON");
+                sensorsOn = switch2;
+                ble_send(sensorsOn ? "SENSORS ON" : "SENSORS OFF");
                 updateLEDs();
                 reportSystemState();
             }
-            vTaskDelay(pdMS_TO_TICKS(300));
         }
-
+        
         // Battery every 5s
         static int64_t last = 0;
         int64_t now = esp_timer_get_time() / 1000;
