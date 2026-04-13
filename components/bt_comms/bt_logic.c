@@ -186,10 +186,19 @@ void ble_app_on_sync(void) {
     uint8_t own_addr_type;
     ble_hs_id_infer_auto(0, &own_addr_type);
 
-    struct ble_gap_adv_params adv_params = {0};
+    // Advertisement data with device name
+    struct ble_hs_adv_fields fields = {0};
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.name = (uint8_t *)"Navigation Vest";
+    fields.name_len = strlen("Navigation Vest");
+    fields.name_is_complete = 1;
+    ble_gap_adv_set_fields(&fields);
 
-    ble_gap_adv_start(0, NULL, BLE_HS_FOREVER,
-                      &adv_params, ble_gap_event, NULL);
+    struct ble_gap_adv_params adv_params = {0};
+    adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;  // undirected connectable
+    adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;  // general discoverable
+
+    ble_gap_adv_start(0, NULL, BLE_HS_FOREVER, &adv_params, ble_gap_event, NULL);
 }
 
 // ===== TASK =====
@@ -206,14 +215,21 @@ void init_bt(void) {
     gpio_set_direction(MOSFET1_PIN, GPIO_MODE_OUTPUT);
     gpio_set_direction(MOSFET2_PIN, GPIO_MODE_OUTPUT);
 
-    gpio_set_direction(BTN1_PIN, GPIO_MODE_INPUT);
-    gpio_set_direction(BTN2_PIN, GPIO_MODE_INPUT);
+    gpio_config_t switch_conf = {
+    .intr_type    = GPIO_INTR_DISABLE,
+    .mode         = GPIO_MODE_INPUT,
+    .pin_bit_mask = (1ULL << BTN1_PIN) | (1ULL << BTN2_PIN),
+    .pull_down_en = GPIO_PULLDOWN_DISABLE,
+    .pull_up_en   = GPIO_PULLUP_ENABLE
+    };
+    gpio_config(&switch_conf);
 
     updateLEDs();
 
     // BLE
     nimble_port_init();
     ble_svc_gap_init();
+    ble_svc_gap_device_name_set("Navigation Vest");
     ble_svc_gatt_init();
     ble_gatts_count_cfg(gatt_svcs);
     ble_gatts_add_svcs(gatt_svcs);
@@ -223,6 +239,12 @@ void init_bt(void) {
 
     // ==== BT COMMS TASK ====
 void bt_comms_task(void *pvParameters) {
+    // Sync initial state with physical switch positions at boot
+    hapticsOn = !gpio_get_level(BTN1_PIN);
+    sensorsOn = !gpio_get_level(BTN2_PIN);
+    updateLEDs();
+    reportSystemState();
+
     while (1) {
 
         // Switch 1 - haptics
@@ -234,11 +256,13 @@ void bt_comms_task(void *pvParameters) {
             reportSystemState();
         }
 
-        // Switch 2 - sensors
+/*        // Switch 2 - sensors
         bool switch2 = gpio_get_level(BTN2_PIN);
         if (switch2 != sensorsOn) {
             if (!switch2) {
                 requestGlassesConfirmation(TURN_SENSORS_OFF);
+                S1 = 0.0f; S2 = 0.0f; S3 = 0.0f; S4 = 0.0f;
+
             } else {
                 sensorsOn = switch2;
                 ble_send(sensorsOn ? "SENSORS ON" : "SENSORS OFF");
@@ -246,6 +270,22 @@ void bt_comms_task(void *pvParameters) {
                 reportSystemState();
             }
         }
+*/
+        //Switch 2 - sensors
+        bool switch2 = !gpio_get_level(BTN2_PIN);
+        if (switch2 != sensorsOn) {
+            sensorsOn = switch2;
+            ble_send(sensorsOn ? "SENSORS ON" : "SENSORS OFF");
+            updateLEDs();
+            reportSystemState();
+        }
+
+        // Debug - remove after testing
+        printf("SW1:%d SW2:%d hapticsOn:%d sensorsOn:%d\n", 
+            gpio_get_level(BTN1_PIN), 
+            gpio_get_level(BTN2_PIN),
+            hapticsOn, 
+            sensorsOn);
         
         // Battery every 5s
         static int64_t last = 0;

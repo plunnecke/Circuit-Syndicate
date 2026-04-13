@@ -20,6 +20,8 @@ extern bool sensorsOn;
 extern uint16_t conn_handle;
 extern uint16_t char_handle;
 
+extern float S1, S2, S3, S4; // from nv_logic.c
+
 void init_bt(void);
 void boot_bt(void);
 
