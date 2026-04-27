@@ -81,11 +81,13 @@ typedef enum {
 #define BLE_TX_POWER ESP_PWR_LVL_N0 // Low power for 6+ hour battery life
 
 // Burst Capture Configuration - for motion detection
-#define BURST_MIN_COUNT 2             // Minimum burst frame count
-#define BURST_DEFAULT_COUNT 5         // Default number of frames in a burst
-#define BURST_MAX_COUNT 8             // Maximum burst frame count
-#define BURST_INTER_CAPTURE_DELAY 250 // Default delay between burst captures (ms)
-#define BURST_INTER_CAPTURE_DELAY_MIN 120
+#define BURST_MIN_COUNT 2      // Minimum burst frame count
+#define BURST_DEFAULT_COUNT 4  // Motion priority: minimum of 4 frames for stronger depth tracking evidence
+#define BURST_MAX_COUNT 8      // Maximum burst frame count
+#define BURST_TARGET_SPAN_MS 2100 // Motion priority: target ~2s from first to last burst frame
+// Ceil(BURST_TARGET_SPAN_MS / (BURST_DEFAULT_COUNT - 1))
+#define BURST_INTER_CAPTURE_DELAY ((BURST_TARGET_SPAN_MS + (BURST_DEFAULT_COUNT - 2)) / (BURST_DEFAULT_COUNT - 1))
+#define BURST_INTER_CAPTURE_DELAY_MIN 200
 #define BURST_INTER_CAPTURE_DELAY_MAX 1200
 #define PASSIVE_BURST_FALLBACK_INTERVAL_MS 15000 // Default fallback burst cadence when no catalyst triggers
 

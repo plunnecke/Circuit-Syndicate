@@ -29,7 +29,7 @@ led_status_t ledMode = LED_BOOT_SEQUENCE;
 unsigned long lastActivity = 0;
 bool powerSaveMode = false;
 
-// Light sleep optimization - saves ~15mA = adds 3-4 hours battery life
+// Light sleep toggle (kept for battery experiments)
 bool lightSleepEnabled = true;
 
 // ---------------------------------------------------------------------------------
@@ -45,16 +45,23 @@ static BLEUUID photoControlUUID(PHOTO_CONTROL_UUID);
 BLECharacteristic *photoDataCharacteristic;
 BLECharacteristic *photoControlCharacteristic;
 
-// State
+// Runtime capture state
 bool connected = false;
 bool isCapturingPhotos = false;
-int captureInterval = 0; // Interval in ms
+int captureInterval = 0; // capture interval in ms
 unsigned long lastCaptureTime = 0;
 bool passiveBurstFallbackEnabled = false;
 bool captureRuntimeEnabled = true;
 unsigned long lastBurstTriggerTime = 0;
 
-// Phase 6 evidence session state
+enum capture_transfer_intent_t : uint8_t {
+    TRANSFER_INTENT_IDLE = 0,
+    TRANSFER_INTENT_SINGLE = 1,
+    TRANSFER_INTENT_BURST = 2
+};
+capture_transfer_intent_t captureTransferIntent = TRANSFER_INTENT_IDLE;
+
+// session timing
 static unsigned long sessionStartMs = 0;
 static unsigned long lastSessionHeartbeatMs = 0;
 static const unsigned long SESSION_HEARTBEAT_INTERVAL_MS = 60000;
@@ -82,6 +89,14 @@ static const uint8_t BURST_CADENCE_ACK_MARKER_HI = 0xFF;
 static const uint8_t BURST_CADENCE_ACK_APPLIED = 0x00;
 static const uint8_t BURST_CADENCE_ACK_CLAMPED = 0x01;
 static const uint8_t BURST_CADENCE_ACK_REJECTED = 0x02;
+static const uint8_t TRANSFER_ABORT_MARKER_LO = 0xFC;
+static const uint8_t TRANSFER_ABORT_MARKER_HI = 0xFF;
+static const uint8_t TRANSFER_ABORT_REASON_UNKNOWN = 0x00;
+static const uint8_t TRANSFER_ABORT_REASON_CMD_SINGLE = 0x01;
+static const uint8_t TRANSFER_ABORT_REASON_CMD_BURST = 0x02;
+static const uint8_t TRANSFER_ABORT_REASON_CAPTURE_DISABLED = 0x03;
+static const uint8_t TRANSFER_ABORT_REASON_BUTTON_PRIORITY = 0x04;
+static const uint8_t TRANSFER_ABORT_REASON_RUNTIME_GUARD = 0x05;
 
 //
 // Camera Frame
@@ -106,9 +121,11 @@ bool take_photo();
 bool take_burst(uint8_t count);
 void freeBurstBuffers();
 void buildBurstUploadOrder();
-uint16_t clampBurstInterCaptureDelay(uint16_t requestedDelayMs);
+uint16_t minimumBurstDelayForMotionWindow(uint8_t frameCount);
+uint16_t clampBurstInterCaptureDelay(uint16_t requestedDelayMs, uint8_t frameCount);
 void sendBurstCadenceAck(uint8_t version, uint8_t ackCode, uint16_t appliedDelayMs);
-void abortActiveCaptureTransfer();
+void sendTransferAbortMarker(uint8_t reasonCode, const char *source);
+void abortActiveCaptureTransfer(uint8_t reasonCode, const char *source);
 void setCaptureRuntimeEnabled(bool enabled, const char *source);
 
 static const char *resetReasonText(esp_reset_reason_t reason)
@@ -247,31 +264,108 @@ void blinkLED(int count, int delayMs)
 // 
 void handleButton()
 {
-    if (!buttonPressed)
-        return;
-
     unsigned long now = millis();
     static unsigned long lastButtonTime = 0;
     static bool buttonDown = false;
     static bool shutdownTriggered = false;
 
-    bool currentButtonState = !digitalRead(POWER_BUTTON_PIN); // Active low (pressed = true)
+    const bool processTransition = buttonPressed;
+    const bool currentButtonState = !digitalRead(POWER_BUTTON_PIN); // Active low (pressed = true)
 
-    // Button press debouncing
-    if (now - lastButtonTime < BUTTON_DEBOUNCE_MS) {
+    // Transition lane (ISR-gated): debounce + press/release edges + short-press path.
+    if (processTransition) {
+        // Button press debouncing
+        if (now - lastButtonTime >= BUTTON_DEBOUNCE_MS) {
+            if (currentButtonState && !buttonDown) {
+                // Button just pressed
+                buttonPressTime = now;
+                buttonDown = true;
+                shutdownTriggered = false;
+                lastButtonTime = now;
+
+            } else if (!currentButtonState && buttonDown) {
+                // Button released
+                buttonDown = false;
+                unsigned long pressDuration = now - buttonPressTime;
+                lastButtonTime = now;
+
+                // Turn off LED in case it was on from hold
+                digitalWrite(STATUS_LED_PIN, HIGH); // LED OFF
+
+                if (pressDuration < POWER_OFF_PRESS_MS && pressDuration >= 10) {
+                    // Short press - take a priority burst
+                    lastActivity = now;
+                    if (powerSaveMode) {
+                        exitPowerSave();
+                    }
+
+                    if (!captureRuntimeEnabled) {
+                        Serial.println("Button pressed: Capture runtime disabled, ignoring burst request.");
+                        emitSessionEvidence(
+                            "BUTTON_BURST",
+                            "BLE=%d;UPLOAD=%d;CAP_EN=0",
+                            connected ? 1 : 0,
+                            photoDataUploading ? 1 : 0
+                        );
+                    } else if (!connected) {
+                        Serial.println("Button pressed: Not connected, cannot capture burst.");
+                        emitSessionEvidence("BUTTON_BURST", "BLE=0;UPLOAD=%d", photoDataUploading ? 1 : 0);
+                    } else {
+                        const bool hadInFlightCapture = photoDataUploading || burstMode || isCapturingPhotos;
+                        if (hadInFlightCapture) {
+                            emitSessionEvidence(
+                                "BUTTON_BURST_OVERRIDE",
+                                "UPLOAD=%d;BURST=%d;INTERVAL=%d",
+                                photoDataUploading ? 1 : 0,
+                                burstMode ? 1 : 0,
+                                isCapturingPhotos ? 1 : 0
+                            );
+                            abortActiveCaptureTransfer(
+                                TRANSFER_ABORT_REASON_BUTTON_PRIORITY,
+                                "BUTTON_PRIORITY_BURST"
+                            );
+                            isCapturingPhotos = false;
+                            captureInterval = 0;
+                            passiveBurstFallbackEnabled = false;
+                            Serial.println("Button burst priority override: flushed active capture state.");
+                        }
+
+                        Serial.printf(
+                            "Button press: Capturing priority burst (%u frames @ %ums).\n",
+                            (unsigned int) BURST_DEFAULT_COUNT,
+                            (unsigned int) burstInterCaptureDelayMs
+                        );
+                        emitSessionEvidence(
+                            "BUTTON_BURST",
+                            "BLE=1;PRIORITY=1;FRAMES=%u;DELAY_MS=%u",
+                            (unsigned int) BURST_DEFAULT_COUNT,
+                            (unsigned int) burstInterCaptureDelayMs
+                        );
+
+                        if (take_burst(BURST_DEFAULT_COUNT)) {
+                            Serial.println("Button burst capture successful. Starting upload.");
+                            captureTransferIntent = TRANSFER_INTENT_BURST;
+                            emitSessionEvidence("STREAM_INTENT", "MODE=BURST;SRC=BUTTON");
+                            photoDataUploading = true;
+                            sent_photo_bytes = 0;
+                            sent_photo_frames = 0;
+                            lastCaptureTime = now;
+                            lastBurstTriggerTime = now;
+                        } else {
+                            Serial.println("Button burst capture failed.");
+                            captureTransferIntent = TRANSFER_INTENT_IDLE;
+                            emitSessionEvidence("BUTTON_BURST_FAILED", "BLE=1;FRAMES=%u", (unsigned int) BURST_DEFAULT_COUNT);
+                        }
+                    }
+                }
+            }
+        }
+
         buttonPressed = false;
-        return;
     }
 
-    if (currentButtonState && !buttonDown) {
-        // Button just pressed
-        buttonPressTime = now;
-        buttonDown = true;
-        shutdownTriggered = false;
-        lastButtonTime = now;
-
-    } else if (currentButtonState && buttonDown) {
-        // Button held - check hold duration
+    // Hold-monitor lane: continue hold-duration checks while button remains down.
+    if (currentButtonState && buttonDown) {
         unsigned long holdDuration = now - buttonPressTime;
 
         if (holdDuration >= POWER_OFF_PRESS_MS && !shutdownTriggered) {
@@ -283,57 +377,8 @@ void handleButton()
                 holdDuration,
                 POWER_OFF_PRESS_MS
             );
-        } else if (holdDuration >= (POWER_OFF_PRESS_MS / 2)) {
-            // Show pending power-off with LED while user keeps holding.
-            digitalWrite(STATUS_LED_PIN, LOW); // LED ON (inverted)
-        }
-
-    } else if (!currentButtonState && buttonDown) {
-        // Button just released
-        buttonDown = false;
-        unsigned long pressDuration = now - buttonPressTime;
-        lastButtonTime = now;
-
-        // Turn off LED in case it was on from hold
-        digitalWrite(STATUS_LED_PIN, HIGH); // LED OFF
-
-        if (pressDuration < POWER_OFF_PRESS_MS && pressDuration >= 10) {
-            // Short press - take a photo
-            lastActivity = now;
-            if (powerSaveMode) {
-                exitPowerSave();
-            }
-            
-            // Trigger photo capture if connected and not already uploading
-            if (!captureRuntimeEnabled) {
-                Serial.println("Button pressed: Capture runtime disabled, ignoring capture request.");
-                emitSessionEvidence(
-                    "BUTTON_SINGLE_PHOTO",
-                    "BLE=%d;UPLOAD=%d;CAP_EN=0",
-                    connected ? 1 : 0,
-                    photoDataUploading ? 1 : 0
-                );
-            } else if (connected && !photoDataUploading) {
-                Serial.println("Button press: Capturing photo.");
-                emitSessionEvidence("BUTTON_SINGLE_PHOTO", "BLE=1;UPLOAD=0");
-                if (take_photo()) {
-                    Serial.println("Button photo capture successful. Starting upload.");
-                    photoDataUploading = true;
-                    sent_photo_bytes = 0;
-                    sent_photo_frames = 0;
-                    lastCaptureTime = now;
-                }
-            } else if (!connected) {
-                Serial.println("Button pressed: Not connected, cannot capture photo.");
-                emitSessionEvidence("BUTTON_SINGLE_PHOTO", "BLE=0;UPLOAD=%d", photoDataUploading ? 1 : 0);
-            } else {
-                Serial.println("Button pressed: Photo upload in progress, please wait.");
-                emitSessionEvidence("BUTTON_SINGLE_PHOTO", "BLE=1;UPLOAD=1");
-            }
         }
     }
-
-    buttonPressed = false;
 }
 
 // 
@@ -357,19 +402,33 @@ void exitPowerSave()
 
 void shutdownDevice()
 {
+    static bool waitingForReleaseLogged = false;
+    const bool buttonStillPressed = !digitalRead(POWER_BUTTON_PIN); // Active low
+
+    // Stop any capture loop
+    isCapturingPhotos = false;
+
+    // Keep LED OFF while waiting to enter deep sleep.
+    digitalWrite(STATUS_LED_PIN, HIGH);
+
+    // Prevent immediate wake by waiting for button release before arming wake.
+    if (buttonStillPressed) {
+        if (!waitingForReleaseLogged) {
+            Serial.println("Shutdown pending: waiting for button release before deep sleep.");
+            emitSessionEvidence("DEEP_SLEEP_WAIT_RELEASE", "REASON=button");
+            waitingForReleaseLogged = true;
+        }
+        return;
+    }
+    waitingForReleaseLogged = false;
+
     Serial.println("Shutting down device.");
     emitSessionEvidence("DEEP_SLEEP_ENTER", "REASON=button");
 
-    // Stop photo capture
-    isCapturingPhotos = false;
-
-    // Disconnect BLE 
+    // Disconnect BLE
     if (connected) {
         Serial.println("Disconnecting BLE.");
     }
-
-    // Turn off LED (inverted logic)
-    digitalWrite(STATUS_LED_PIN, HIGH);
 
     // Enter deep sleep
     esp_sleep_enable_ext0_wakeup(static_cast<gpio_num_t>(POWER_BUTTON_PIN), 0); // Wake on button press
@@ -564,19 +623,19 @@ void configure_ble()
     Serial.println("Camera BLE service registered.");
 }
 
-// 
-// Camera
-// 
+//
+// Camera capture helpers
+//
 bool take_photo()
 {
-    // Release previous buffer
+    // Release any prior frame buffer first
     if (fb) {
         Serial.println("Releasing previous camera buffer.");
         esp_camera_fb_return(fb);
         fb = nullptr;
     }
 
-    // Drain all stale frames from the FIFO queue (fb_count = 3)
+    // Flush stale FIFO frames (fb_count is 3)
     for (int flush = 0; flush < 3; flush++) {
         camera_fb_t* stale = esp_camera_fb_get();
         if (stale) {
@@ -622,15 +681,44 @@ bool take_photo()
 // 
 // Burst Capture Functions
 // 
-uint16_t clampBurstInterCaptureDelay(uint16_t requestedDelayMs)
+uint16_t minimumBurstDelayForMotionWindow(uint8_t frameCount)
 {
-    if (requestedDelayMs < BURST_INTER_CAPTURE_DELAY_MIN) {
+    if (frameCount <= 1) {
         return BURST_INTER_CAPTURE_DELAY_MIN;
     }
-    if (requestedDelayMs > BURST_INTER_CAPTURE_DELAY_MAX) {
-        return BURST_INTER_CAPTURE_DELAY_MAX;
+
+    const uint32_t intervals = static_cast<uint32_t>(frameCount) - 1U;
+    const uint32_t requiredDelayMs =
+        (static_cast<uint32_t>(BURST_TARGET_SPAN_MS) + intervals - 1U) / intervals;
+
+    uint16_t clampedDelayMs = static_cast<uint16_t>(requiredDelayMs);
+    if (clampedDelayMs < BURST_INTER_CAPTURE_DELAY_MIN) {
+        clampedDelayMs = BURST_INTER_CAPTURE_DELAY_MIN;
     }
-    return requestedDelayMs;
+    if (clampedDelayMs > BURST_INTER_CAPTURE_DELAY_MAX) {
+        clampedDelayMs = BURST_INTER_CAPTURE_DELAY_MAX;
+    }
+
+    return clampedDelayMs;
+}
+
+uint16_t clampBurstInterCaptureDelay(uint16_t requestedDelayMs, uint8_t frameCount)
+{
+    uint16_t clampedDelayMs = requestedDelayMs;
+
+    if (clampedDelayMs < BURST_INTER_CAPTURE_DELAY_MIN) {
+        clampedDelayMs = BURST_INTER_CAPTURE_DELAY_MIN;
+    }
+    if (clampedDelayMs > BURST_INTER_CAPTURE_DELAY_MAX) {
+        clampedDelayMs = BURST_INTER_CAPTURE_DELAY_MAX;
+    }
+
+    const uint16_t motionMinimumDelayMs = minimumBurstDelayForMotionWindow(frameCount);
+    if (clampedDelayMs < motionMinimumDelayMs) {
+        clampedDelayMs = motionMinimumDelayMs;
+    }
+
+    return clampedDelayMs;
 }
 
 void sendBurstCadenceAck(uint8_t version, uint8_t ackCode, uint16_t appliedDelayMs)
@@ -757,10 +845,23 @@ bool take_burst(uint8_t count)
         );
     }
 
+    const uint16_t appliedInterCaptureDelayMs =
+        clampBurstInterCaptureDelay(burstInterCaptureDelayMs, count);
+
+    if (appliedInterCaptureDelayMs != burstInterCaptureDelayMs) {
+        Serial.printf(
+            "Burst delay adjusted for motion span: requested=%u applied=%u frames=%u target_span_ms=%u\n",
+            (unsigned int) burstInterCaptureDelayMs,
+            (unsigned int) appliedInterCaptureDelayMs,
+            (unsigned int) count,
+            (unsigned int) BURST_TARGET_SPAN_MS
+        );
+    }
+
     Serial.printf(
         "Burst capture: %u frames, %ums inter-frame delay\n",
         (unsigned int) count,
-        (unsigned int) burstInterCaptureDelayMs
+        (unsigned int) appliedInterCaptureDelayMs
     );
 
     freeBurstBuffers();
@@ -786,10 +887,10 @@ bool take_burst(uint8_t count)
     for (int i = 0; i < count; i++) {
         camera_fb_t *frame = nullptr;
 
-        // Wait for inter-frame delay, then enforce monotonic timestamp gating
-        // so each accepted burst frame is strictly newer than the previous one.
+        // Delay between frames, then enforce timestamps so each accepted
+        // frame is newer than the previous one.
         if (i > 0) {
-            delay(burstInterCaptureDelayMs);
+            delay(appliedInterCaptureDelayMs);
         }
 
         int discarded = 0;
@@ -819,7 +920,7 @@ bool take_burst(uint8_t count)
             esp_camera_fb_return(candidate);
             discarded++;
             if (discarded > 10) {
-                // Safety valve — take next frame regardless, but log gate failure.
+                // Safety valve: take next frame anyway, but log that the gate failed.
                 Serial.printf(
                     "Burst: timestamp gate safety limit reached for frame %d (minAcceptedMs=%u)\n",
                     i,
@@ -844,7 +945,7 @@ bool take_burst(uint8_t count)
             return false;
         }
 
-        // Validate JPEG
+        // Validate JPEG header
         if (frame->len < 4 || frame->buf[0] != 0xFF || frame->buf[1] != 0xD8 || frame->buf[2] != 0xFF) {
             Serial.printf("Burst: Invalid JPEG on frame %d\n", i);
             esp_camera_fb_return(frame);
@@ -885,11 +986,54 @@ bool take_burst(uint8_t count)
     return true;
 }
 
-void abortActiveCaptureTransfer()
+void sendTransferAbortMarker(uint8_t reasonCode, const char *source)
 {
+    if (!connected || photoDataCharacteristic == nullptr) {
+        return;
+    }
+
+    uint8_t marker[3] = {
+        TRANSFER_ABORT_MARKER_LO,
+        TRANSFER_ABORT_MARKER_HI,
+        reasonCode
+    };
+    photoDataCharacteristic->setValue(marker, sizeof(marker));
+    photoDataCharacteristic->notify();
+    delay(BLE_PHOTO_TRANSFER_DELAY);
+
+    emitSessionEvidence(
+        "TRANSFER_ABORT_MARKER_SENT",
+        "REASON=%u;SRC=%s",
+        static_cast<unsigned int>(reasonCode),
+        source != nullptr ? source : "UNKNOWN"
+    );
+}
+
+void abortActiveCaptureTransfer(uint8_t reasonCode, const char *source)
+{
+    const char *origin = source != nullptr ? source : "UNKNOWN";
+    const bool hadTransferState =
+        photoDataUploading || fb != nullptr || burstMode ||
+        sent_photo_bytes > 0 || sent_photo_frames > 0 || burstCapturedFrames > 0;
+
+    if (hadTransferState) {
+        sendTransferAbortMarker(reasonCode, origin);
+        emitSessionEvidence(
+            "TRANSFER_ABORT",
+            "REASON=%u;SRC=%s;UPLOAD=%d;BURST=%d;BYTES=%u;CHUNKS=%u",
+            static_cast<unsigned int>(reasonCode),
+            origin,
+            photoDataUploading ? 1 : 0,
+            burstMode ? 1 : 0,
+            static_cast<unsigned int>(sent_photo_bytes),
+            static_cast<unsigned int>(sent_photo_frames)
+        );
+    }
+
     photoDataUploading = false;
     sent_photo_bytes = 0;
     sent_photo_frames = 0;
+    captureTransferIntent = TRANSFER_INTENT_IDLE;
 
     if (fb) {
         esp_camera_fb_return(fb);
@@ -919,10 +1063,15 @@ void setCaptureRuntimeEnabled(bool enabled, const char *source)
         isCapturingPhotos = false;
         captureInterval = 0;
         passiveBurstFallbackEnabled = false;
-        abortActiveCaptureTransfer();
+        captureTransferIntent = TRANSFER_INTENT_IDLE;
+        abortActiveCaptureTransfer(TRANSFER_ABORT_REASON_CAPTURE_DISABLED, "CAPTURE_RUNTIME_DISABLED");
     } else {
-        // Keep fallback OFF until explicitly armed by an app interval command.
+        // Keep fallback OFF until the app explicitly arms interval capture.
         passiveBurstFallbackEnabled = false;
+        // Preserve in-flight intent (especially button burst) when re-enabled.
+        if (!photoDataUploading && !burstMode && fb == nullptr) {
+            captureTransferIntent = TRANSFER_INTENT_IDLE;
+        }
         lastBurstTriggerTime = millis();
     }
 
@@ -940,13 +1089,13 @@ void setCaptureRuntimeEnabled(bool enabled, const char *source)
     );
 }
 
-// Photo Control handler
-// 0x00 = Disable capture runtime (stop capture + upload + fallback)
-// 0x01 = Take single photo
-// 0x02 = Interval capture
-// 0x03 = Enable capture runtime
-// 0x04 = Burst capture
-// 0x05 = Burst cadence hint payload [cmd, version, delay_lo, delay_hi, health]
+// Photo control map
+// 0x00 => disable capture runtime (capture/upload/fallback off)
+// 0x01 => single photo
+// 0x02 => interval capture
+// 0x03 => enable capture runtime
+// 0x04 => burst capture
+// 0x05 => burst cadence hint payload [cmd, version, delay_lo, delay_hi, health]
 void handlePhotoControlPayload(const uint8_t *payload, size_t payloadLen)
 {
     if (payload == nullptr || payloadLen == 0) return;
@@ -975,7 +1124,8 @@ void handlePhotoControlPayload(const uint8_t *payload, size_t payloadLen)
             return;
         }
 
-        const uint16_t appliedDelayMs = clampBurstInterCaptureDelay(requestedDelayMs);
+        const uint16_t appliedDelayMs =
+            clampBurstInterCaptureDelay(requestedDelayMs, BURST_DEFAULT_COUNT);
         const uint8_t ackCode =
             (appliedDelayMs == requestedDelayMs) ? BURST_CADENCE_ACK_APPLIED : BURST_CADENCE_ACK_CLAMPED;
 
@@ -1002,51 +1152,81 @@ void handlePhotoControlPayload(const uint8_t *payload, size_t payloadLen)
     handlePhotoControl(static_cast<int8_t>(command));
 }
 
+static bool isBurstTransferInProgress()
+{
+    return burstMode || (photoDataUploading && captureTransferIntent == TRANSFER_INTENT_BURST);
+}
+
 void handlePhotoControl(int8_t controlValue)
 {
     switch (controlValue) {
-    case 0x00: // Disable capture runtime
+    case 0x00: // disable capture runtime
         Serial.println("Command: Disable capture runtime.");
         emitSessionEvidence("CMD_CAPTURE_DISABLE", "SRC=BLE");
+        captureTransferIntent = TRANSFER_INTENT_IDLE;
         setCaptureRuntimeEnabled(false, "BLE_CMD");
         break;
 
-    case 0x03: // Enable capture runtime
+    case 0x03: // enable capture runtime
         Serial.println("Command: Enable capture runtime.");
         emitSessionEvidence("CMD_CAPTURE_ENABLE", "SRC=BLE");
         setCaptureRuntimeEnabled(true, "BLE_CMD");
         break;
         
-    case 0x01: // Single photo
+    case 0x01: // single photo
     case -1:   
         if (!captureRuntimeEnabled) {
             Serial.println("Command rejected: capture runtime disabled (single photo).");
             emitSessionEvidence("CMD_REJECTED", "CMD=0x01;REASON=CAPTURE_DISABLED");
             break;
         }
+        if (isBurstTransferInProgress()) {
+            Serial.println("Command: Single photo deferred while burst transfer is active.");
+            emitSessionEvidence(
+                "CMD_SINGLE_DEFERRED",
+                "REASON=BURST_ACTIVE;UPLOAD=%d;BURST=%d;INTENT=%u",
+                photoDataUploading ? 1 : 0,
+                burstMode ? 1 : 0,
+                static_cast<unsigned int>(captureTransferIntent)
+            );
+            break;
+        }
         Serial.println("Command: Take single photo.");
         emitSessionEvidence("CMD_SINGLE_PHOTO", "SRC=BLE");
-        // Cancel any in-progress upload to prioritize new capture
-        if (photoDataUploading) {
-            photoDataUploading = false;
-            if (fb) { esp_camera_fb_return(fb); fb = nullptr; }
-            freeBurstBuffers();
+        // Cancel in-flight upload so the new single capture gets priority
+        if (photoDataUploading || burstMode || fb != nullptr) {
+            abortActiveCaptureTransfer(TRANSFER_ABORT_REASON_CMD_SINGLE, "CMD_SINGLE_PHOTO");
             Serial.println("Cancelled previous upload for new capture.");
         }
+        captureTransferIntent = TRANSFER_INTENT_SINGLE;
+        emitSessionEvidence("STREAM_INTENT", "MODE=SINGLE;SRC=CMD_SINGLE");
         isCapturingPhotos = true;
         captureInterval = 0;
         passiveBurstFallbackEnabled = false;
         break;
         
-    case 0x02: // Start interval capture
+    case 0x02: // start interval capture
         if (!captureRuntimeEnabled) {
             Serial.println("Command rejected: capture runtime disabled (interval capture).");
             emitSessionEvidence("CMD_REJECTED", "CMD=0x02;REASON=CAPTURE_DISABLED");
             break;
         }
+        if (isBurstTransferInProgress()) {
+            Serial.println("Command: Interval capture deferred while burst transfer is active.");
+            emitSessionEvidence(
+                "CMD_INTERVAL_DEFERRED",
+                "CMD=0x02;REASON=BURST_ACTIVE;UPLOAD=%d;BURST=%d;INTENT=%u",
+                photoDataUploading ? 1 : 0,
+                burstMode ? 1 : 0,
+                static_cast<unsigned int>(captureTransferIntent)
+            );
+            break;
+        }
         Serial.println("Command: Start interval capture.");
         captureInterval = PHOTO_CAPTURE_INTERVAL_MS;
         passiveBurstFallbackEnabled = true;
+        captureTransferIntent = TRANSFER_INTENT_SINGLE;
+        emitSessionEvidence("STREAM_INTENT", "MODE=SINGLE;SRC=CMD_INTERVAL");
         Serial.print("Capture interval: ");
         Serial.print(captureInterval / 1000);
         Serial.println(" seconds");
@@ -1055,7 +1235,7 @@ void handlePhotoControl(int8_t controlValue)
         lastCaptureTime = millis() - captureInterval;
         break;
 
-    case 0x04: // Burst capture 
+    case 0x04: // burst capture
         if (!captureRuntimeEnabled) {
             Serial.println("Command rejected: capture runtime disabled (burst capture).");
             emitSessionEvidence("CMD_REJECTED", "CMD=0x04;REASON=CAPTURE_DISABLED");
@@ -1072,14 +1252,14 @@ void handlePhotoControl(int8_t controlValue)
             (unsigned int) BURST_DEFAULT_COUNT,
             (unsigned int) burstInterCaptureDelayMs
         );
-        // Cancel any in-progress upload to prioritize burst
-        if (photoDataUploading) {
-            photoDataUploading = false;
-            if (fb) { esp_camera_fb_return(fb); fb = nullptr; }
-            freeBurstBuffers();
+        // Cancel in-flight upload so burst can start immediately
+        if (photoDataUploading || burstMode || fb != nullptr) {
+            abortActiveCaptureTransfer(TRANSFER_ABORT_REASON_CMD_BURST, "CMD_BURST");
             Serial.println("Cancelled previous upload for burst.");
         }
         passiveBurstFallbackEnabled = false;
+        captureTransferIntent = TRANSFER_INTENT_BURST;
+        emitSessionEvidence("STREAM_INTENT", "MODE=BURST;SRC=CMD_BURST");
         if (!photoDataUploading && !burstMode) {
             if (take_burst(BURST_DEFAULT_COUNT)) {
                 Serial.println("Burst capture successful. Starting upload.");
@@ -1088,6 +1268,8 @@ void handlePhotoControl(int8_t controlValue)
                 sent_photo_frames = 0;
                 lastCaptureTime = millis();
                 lastBurstTriggerTime = lastCaptureTime;
+            } else {
+                captureTransferIntent = TRANSFER_INTENT_IDLE;
             }
         } else {
             Serial.println("Burst: Upload already in progress.");
@@ -1108,11 +1290,28 @@ void handlePhotoControl(int8_t controlValue)
                 );
                 break;
             }
+            if (isBurstTransferInProgress()) {
+                Serial.printf(
+                    "Legacy interval command deferred while burst transfer is active (cmd=%d).\n",
+                    controlValue
+                );
+                emitSessionEvidence(
+                    "CMD_INTERVAL_DEFERRED",
+                    "CMD=0x%02X;REASON=BURST_ACTIVE;UPLOAD=%d;BURST=%d;INTENT=%u",
+                    static_cast<unsigned int>(controlValue & 0xFF),
+                    photoDataUploading ? 1 : 0,
+                    burstMode ? 1 : 0,
+                    static_cast<unsigned int>(captureTransferIntent)
+                );
+                break;
+            }
             Serial.print("Command: Start interval capture");
             Serial.print(controlValue);
             Serial.println(")");
             captureInterval = PHOTO_CAPTURE_INTERVAL_MS;
             passiveBurstFallbackEnabled = true;
+            captureTransferIntent = TRANSFER_INTENT_SINGLE;
+            emitSessionEvidence("STREAM_INTENT", "MODE=SINGLE;SRC=CMD_INTERVAL_LEGACY");
             isCapturingPhotos = true;
             lastCaptureTime = millis() - captureInterval;
             emitSessionEvidence(
@@ -1129,9 +1328,9 @@ void handlePhotoControl(int8_t controlValue)
     }
 }
 
-// 
+//
 // configure_camera()
-// 
+//
 void configure_camera()
 {
     Serial.println("Initializing camera.");
@@ -1156,7 +1355,7 @@ void configure_camera()
     config.pin_reset = RESET_GPIO_NUM;
     config.xclk_freq_hz = CAMERA_XCLK_FREQ;
 
-    // Use config.h camera settings optimized for battery life
+    // Pull camera tuning from config.h
     config.frame_size = CAMERA_FRAME_SIZE;
     config.pixel_format = PIXFORMAT_JPEG;
     config.fb_count = 3;
@@ -1170,7 +1369,7 @@ void configure_camera()
     } else {
         Serial.println("Camera initialized successfully.");
         
-        // Image flip
+        // Flip image to match physical mounting
         sensor_t *s = esp_camera_sensor_get();
         if (s != NULL) {
             s->set_vflip(s, 1);   
@@ -1180,11 +1379,11 @@ void configure_camera()
     }
 }
 
-// 
-// Setup & Loop
-// 
+//
+// Setup + main loop
+//
 
-// A small buffer for sending photo chunks over BLE
+// Scratch buffer for BLE photo chunks
 static uint8_t *s_compressed_frame_2 = nullptr;
 
 void setup_app()
@@ -1204,27 +1403,27 @@ void setup_app()
         HARDWARE_REVISION
     );
 
-    // Initialize GPIO
+    // GPIO init
     pinMode(POWER_BUTTON_PIN, INPUT_PULLUP);
     pinMode(STATUS_LED_PIN, OUTPUT);
 
-    // LED uses inverted logic: HIGH = OFF, LOW = ON
+    // LED is inverted: HIGH=off, LOW=on
     digitalWrite(STATUS_LED_PIN, HIGH);
 
-    // Setup button interrupt
+    // Button interrupt setup
     attachInterrupt(digitalPinToInterrupt(POWER_BUTTON_PIN), buttonISR, CHANGE);
 
-    // Start LED boot sequence
+    // Kick off boot LED sequence
     ledMode = LED_BOOT_SEQUENCE;
 
-    // Power optimization from config.h
+    // Baseline CPU clock from config
     setCpuFrequencyMhz(NORMAL_CPU_FREQ_MHZ);
     lastActivity = millis();
 
     configure_ble();
     configure_camera();
 
-    // Allocate buffer for photo chunks (BLE_CHUNK_SIZE + 3 for header)
+    // Allocate BLE transfer buffer (chunk + header room)
     s_compressed_frame_2 = (uint8_t *) ps_calloc(BLE_CHUNK_SIZE + 3, sizeof(uint8_t));
     if (!s_compressed_frame_2) {
         Serial.println("Failed to allocate chunk buffer!");
@@ -1232,7 +1431,7 @@ void setup_app()
         Serial.printf("Chunk buffer allocated: %d bytes\n", BLE_CHUNK_SIZE + 3);
     }
 
-    // Start idle
+    // Start in idle capture state
     isCapturingPhotos = false;
     captureInterval = 0;
     passiveBurstFallbackEnabled = false;
@@ -1250,10 +1449,9 @@ void setup_app()
         (unsigned int) PASSIVE_BURST_FALLBACK_INTERVAL_MS
     );
 
-    // Initial battery reading
-    // Battery voltage divider
-    analogReadResolution(12);                           // optional: set 12-bit resolution
-    analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db); // set attenuation for full 3.3V range
+    // Initial battery reading setup
+    analogReadResolution(12);                            // keep ADC at 12-bit
+    analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db); // full-ish 3.3V ADC range
 
     readBatteryLevel();
     deviceState = DEVICE_ACTIVE;
@@ -1286,13 +1484,13 @@ void loop_app()
         );
     }
 
-    // Handle button presses
+    // Button handling
     handleButton();
 
-    // Update LED
+    // LED update
     updateLED();
 
-    // Check for power save mode (gentle optimization)
+    // Power-save entry/exit checks
     if (!connected && !photoDataUploading && (now - lastActivity > IDLE_THRESHOLD_MS)) {
         enterPowerSave();
     } else if (connected || photoDataUploading) {
@@ -1301,14 +1499,14 @@ void loop_app()
         lastActivity = now;
     }
 
-    // Check battery level periodically
+    // Periodic battery task
     if (now - lastBatteryCheck >= BATTERY_TASK_INTERVAL_MS) {
         readBatteryLevel();
         updateBatteryService();
         lastBatteryCheck = now;
     }
 
-    // Force a battery update on every new BLE connection (including reconnects).
+    // Force one battery push after each BLE connect/reconnect.
     static bool firstBatteryUpdateAfterConnect = true;
     if (!connected) {
         firstBatteryUpdateAfterConnect = true;
@@ -1321,16 +1519,17 @@ void loop_app()
 
     if (!captureRuntimeEnabled && photoDataUploading) {
         Serial.println("Capture runtime disabled: aborting active upload.");
-        abortActiveCaptureTransfer();
+        abortActiveCaptureTransfer(TRANSFER_ABORT_REASON_RUNTIME_GUARD, "LOOP_RUNTIME_GUARD");
     }
 
-    // Check if it's time to capture a photo
+    // Decide if it's time to capture
     if (captureRuntimeEnabled && isCapturingPhotos && !photoDataUploading && connected) {
         if ((captureInterval == 0) || (now - lastCaptureTime >= (unsigned long) captureInterval)) {
             if (captureInterval == 0) {
-                // Single shot if interval=0
+                // interval=0 means one-shot
                 isCapturingPhotos = false;
             }
+            captureTransferIntent = TRANSFER_INTENT_SINGLE;
             Serial.println("Interval reached. Capturing photo.");
             if (take_photo()) {
                 Serial.println("Photo capture successful. Starting upload.");
@@ -1342,7 +1541,7 @@ void loop_app()
         }
     }
 
-    // If no catalyst burst occurred recently, fall back to periodic burst capture.
+    // If no recent catalyst burst happened, use periodic fallback burst.
     if (captureRuntimeEnabled && connected && passiveBurstFallbackEnabled && !photoDataUploading && !burstMode) {
         if (now - lastBurstTriggerTime >= PASSIVE_BURST_FALLBACK_INTERVAL_MS) {
             Serial.printf(
@@ -1356,6 +1555,8 @@ void loop_app()
                 (unsigned int) BURST_DEFAULT_COUNT,
                 (unsigned int) burstInterCaptureDelayMs
             );
+            captureTransferIntent = TRANSFER_INTENT_BURST;
+            emitSessionEvidence("STREAM_INTENT", "MODE=BURST;SRC=PASSIVE_FALLBACK");
             if (take_burst(BURST_DEFAULT_COUNT)) {
                 Serial.println("Passive fallback burst successful. Starting upload.");
                 photoDataUploading = true;
@@ -1365,14 +1566,31 @@ void loop_app()
                 lastBurstTriggerTime = now;
             } else {
                 Serial.println("Passive fallback burst failed.");
-                // Avoid hot-loop retries if camera fails temporarily.
+                captureTransferIntent = TRANSFER_INTENT_IDLE;
+                // Avoid tight retry loops if camera fails temporarily.
                 lastBurstTriggerTime = now;
             }
         }
     }
 
-    // If uploading, send chunks over BLE
+    // Upload path: stream JPEG chunks over BLE
     if (photoDataUploading && burstMode) {
+        if (captureTransferIntent != TRANSFER_INTENT_BURST) {
+            Serial.printf(
+                "Stream guard: blocked burst upload while intent=%u\n",
+                static_cast<unsigned int>(captureTransferIntent)
+            );
+            emitSessionEvidence(
+                "STREAM_GUARD",
+                "BLOCK=BURST_UPLOAD;INTENT=%u;BURST=%d;UPLOAD=%d",
+                static_cast<unsigned int>(captureTransferIntent),
+                burstMode ? 1 : 0,
+                photoDataUploading ? 1 : 0
+            );
+            abortActiveCaptureTransfer(TRANSFER_ABORT_REASON_CMD_SINGLE, "STREAM_GUARD_BURST_IN_SINGLE");
+            return;
+        }
+
         uint8_t logicalSeq = burstCurrentFrame;
         if (logicalSeq < burstCapturedFrames) {
             uint8_t bIdx = burstUploadOrder[logicalSeq];
@@ -1391,6 +1609,7 @@ void loop_app()
                     static_cast<unsigned int>(bIdx)
                 );
                 photoDataUploading = false;
+                captureTransferIntent = TRANSFER_INTENT_IDLE;
                 freeBurstBuffers();
                 return;
             }
@@ -1410,7 +1629,7 @@ void loop_app()
                     s_compressed_frame_2[5] = (uint8_t) ((captureMs >> 8) & 0xFF);
                     s_compressed_frame_2[6] = (uint8_t) ((captureMs >> 16) & 0xFF);
                     s_compressed_frame_2[7] = (uint8_t) ((captureMs >> 24) & 0xFF);
-                    bytes_to_copy = (remaining > (BLE_CHUNK_SIZE - 6)) ? (BLE_CHUNK_SIZE - 6) : remaining;
+                    bytes_to_copy = (remaining > (BLE_CHUNK_SIZE - 8)) ? (BLE_CHUNK_SIZE - 8) : remaining;
                     memcpy(&s_compressed_frame_2[8], &burstJpegData[bIdx][sent_photo_bytes], bytes_to_copy);
                     photoDataCharacteristic->setValue(s_compressed_frame_2, bytes_to_copy + 8);
                 } else {
@@ -1456,16 +1675,30 @@ void loop_app()
                     Serial.println("Burst transfer complete (0xFFFE sent).");
 
                     photoDataUploading = false;
+                    captureTransferIntent = TRANSFER_INTENT_IDLE;
                     freeBurstBuffers();
                 }
             }
         }
     } else if (photoDataUploading && fb) {
+        if (captureTransferIntent == TRANSFER_INTENT_BURST) {
+            Serial.println("Stream guard: blocked single upload while burst intent is active.");
+            emitSessionEvidence(
+                "STREAM_GUARD",
+                "BLOCK=SINGLE_UPLOAD;INTENT=%u;BURST=%d;UPLOAD=%d",
+                static_cast<unsigned int>(captureTransferIntent),
+                burstMode ? 1 : 0,
+                photoDataUploading ? 1 : 0
+            );
+            abortActiveCaptureTransfer(TRANSFER_ABORT_REASON_CMD_BURST, "STREAM_GUARD_SINGLE_IN_BURST");
+            return;
+        }
+
         size_t remaining = fb->len - sent_photo_bytes;
         if (remaining > 0) {
             size_t bytes_to_copy;
             if (sent_photo_frames == 0) {
-                // First chunk: includes orientation metadata
+                // First chunk includes orientation metadata
                 s_compressed_frame_2[0] = 0; // Frame index low byte
                 s_compressed_frame_2[1] = 0; // Frame index high byte
                 s_compressed_frame_2[2] = (uint8_t) current_photo_orientation;
@@ -1473,7 +1706,7 @@ void loop_app()
                 memcpy(&s_compressed_frame_2[3], &fb->buf[sent_photo_bytes], bytes_to_copy);
                 photoDataCharacteristic->setValue(s_compressed_frame_2, bytes_to_copy + 3);
                 
-                // Debug: Show whats being sent in first chunk
+                // Debug print of first chunk payload prefix
                 Serial.print("First chunk header: idx=");
                 Serial.print(s_compressed_frame_2[0]);
                 Serial.print(",");
@@ -1509,7 +1742,7 @@ void loop_app()
             Serial.print(remaining - bytes_to_copy);
             Serial.println(" bytes remaining.");
 
-            lastActivity = now; // Register activity
+            lastActivity = now; // upload counts as activity
         } else {
             s_compressed_frame_2[0] = 0xFF;
             s_compressed_frame_2[1] = 0xFF;
@@ -1519,14 +1752,15 @@ void loop_app()
             Serial.println("Photo upload complete.");
 
             photoDataUploading = false;
+            captureTransferIntent = TRANSFER_INTENT_IDLE;
             esp_camera_fb_return(fb);
             fb = nullptr;
             Serial.println("Camera frame buffer freed.");
         }
     }
 
-    // Light sleep - DISABLED for BLE debugging
-    // TODO: Re-enable once BLE connection is stable
+    // Light sleep currently disabled to ensure BLE connectivity maintained.
+    // DO NOT RE-ENABLE WITHOUT TESTING BLE CONNECTIVITY IMPACT THOROUGHLY.
     // if (!photoDataUploading && lightSleepEnabled && connected) {
     //     esp_sleep_enable_timer_wakeup(LIGHT_SLEEP_DURATION_US);
     //     esp_light_sleep_start();
