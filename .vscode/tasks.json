@@ -1,0 +1,11 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "phase6-status-control-box",
+			"type": "shell",
+			"command": "git status --short -- components/bt_comms/bt_logic.c components/non_visual/nv_logic.c",
+			"isBackground": false
+		}
+	]
+}

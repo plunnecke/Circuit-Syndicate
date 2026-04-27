@@ -6,6 +6,7 @@
 
 #include "nv_includes.h"
 #include "nv_config.h"
+#include "esp_timer.h"
 
 // ============================================================
 //  GLOBALS
@@ -19,6 +20,13 @@ float S4 = 0.0f;
 
 // Object detection flag (true if any sensor detects an object within range)
 bool object_detected = false;
+
+// Phase 6 evidence counters (consumed by bt_logic.c for unified session timeline)
+volatile uint32_t nv_sample_count = 0;
+volatile uint32_t nv_object_detect_count = 0;
+volatile int64_t nv_last_sample_ms = 0;
+volatile uint32_t nv_sensor_disabled_cycles = 0;
+volatile uint32_t nv_battery_read_count = 0;
 
 // Internal sensor state
 static sensor_t sensors[NUM_SENSORS];
@@ -64,10 +72,14 @@ esp_err_t max17048_read_reg(uint8_t reg_addr, uint16_t *reg_data) {
 // ============================================================
 
 void non_visual_task(void *pvParameters) {
+    bool previous_object_detected = false;
+    int64_t last_evidence_log_ms = 0;
+
     while (1) {
         if (!sensorsOn) {
             // Sensors disabled by bt_comms - clear readings
             S1 = S2 = S3 = S4 = 0.0f;
+            nv_sensor_disabled_cycles++;
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
@@ -79,7 +91,7 @@ void non_visual_task(void *pvParameters) {
 
         // Read each sensor
         for (int i = 0; i < NUM_SENSORS; i++) {
-            vTaskDelay(pdMS_TO_TICKS(10));
+            vTaskDelay(pdMS_TO_TICKS(22));
 
             int raw = 0, mv = 0;
             if (adc_oneshot_read(adc_handle, sensors[i].channel, &raw) == ESP_OK) {
@@ -106,7 +118,8 @@ void non_visual_task(void *pvParameters) {
                 for (int j = 0; j < WINDOW_SIZE; j++)
                     sum += sensors[i].buffer[j];
 
-                sensors[i].result_ft = roundf(sum / WINDOW_SIZE);
+                float avg = sum / WINDOW_SIZE;
+                sensors[i].result_ft = (avg >= 6.3f) ? 7.0f : roundf(avg);
             }
         }
 
@@ -118,14 +131,44 @@ void non_visual_task(void *pvParameters) {
 
         // Update object detection flag 
         object_detected = (S1 > NO_READING) || (S2 > NO_READING) || (S3 > NO_READING) || (S4 > NO_READING);
+        if (object_detected && !previous_object_detected) {
+            nv_object_detect_count++;
+        }
+        previous_object_detected = object_detected;
 
         // Battery read
         uint16_t soc_raw = 0;
-        if (max17048_read_reg(MAX17048_SOC_REG, &soc_raw) == ESP_OK)
+        if (max17048_read_reg(MAX17048_SOC_REG, &soc_raw) == ESP_OK) {
             battery_percentage = soc_raw / 256.0f;
+            nv_battery_read_count++;
+        }
 
-        printf("\rS1:%.0f | S2:%.0f | S3:%.0f | S4:%.0f | Bat:%.2f%%",
-               S1, S2, S3, S4, battery_percentage);
+        nv_sample_count++;
+        nv_last_sample_ms = esp_timer_get_time() / 1000;
+
+        if (nv_last_sample_ms - last_evidence_log_ms >= 60000) {
+            last_evidence_log_ms = nv_last_sample_ms;
+            ESP_LOGI(
+                "NV_LOGIC",
+                "SESSION_EVIDENCE:DEV=VEST_NV;EV=HEARTBEAT;UP=%lld;SAMPLES=%lu;OD=%lu;BAT_RD=%lu;SENS_OFF=%lu",
+                (long long) nv_last_sample_ms,
+                (unsigned long) nv_sample_count,
+                (unsigned long) nv_object_detect_count,
+                (unsigned long) nv_battery_read_count,
+                (unsigned long) nv_sensor_disabled_cycles
+            );
+        }
+
+        //printf("\rS1:%.0f | S2:%.0f | S3:%.0f | S4:%.0f | Bat:%.2f%%",
+        //       S1, S2, S3, S4, battery_percentage);
+        //fflush(stdout);
+
+        printf("\rS1:%.0f | S2:%.0f | S3:%.0f | S4:%.0f | Bat:%.2f%% | H1:%s | H2:%s | H3:%s | H4:%s",
+            S1, S2, S3, S4, battery_percentage,
+            S1 > NO_READING ? "On " : "Off",
+            S2 > NO_READING ? "On " : "Off",
+            S3 > NO_READING ? "On " : "Off",
+            S4 > NO_READING ? "On " : "Off");
         fflush(stdout);
 
         vTaskDelay(pdMS_TO_TICKS(50));

@@ -13,8 +13,8 @@ void app_main(void) {
     printf("=============================\n\n");
 
     boot_nv();
-    boot_haps();
     boot_bt();
+    boot_haps();
 
     printf("All modules initialized.\n");    
 

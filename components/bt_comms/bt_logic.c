@@ -1,10 +1,18 @@
 #include "bt_includes.h"
 #include "bt_config.h"
+#include "esp_system.h"
 
 bool hapticsOn = true;
 bool sensorsOn = true;
 static bool awaitingGlassesResponse = false;
+static bool appOverrideActive = false;
+static bool systemPowerLockedOff = false;
 extern bool object_detected; // from nv_logic.c
+extern volatile uint32_t nv_sample_count;       // from nv_logic.c
+extern volatile uint32_t nv_object_detect_count; // from nv_logic.c
+extern volatile int64_t nv_last_sample_ms;      // from nv_logic.c
+
+void ble_send(const char *msg);
 
 typedef enum {
     NONE,
@@ -13,6 +21,11 @@ typedef enum {
 } PendingAction;
 
 static PendingAction pendingAction = NONE;
+
+static int64_t bt_boot_time_ms = 0;
+static int64_t bt_last_heartbeat_ms = 0;
+static uint32_t bt_disconnect_count = 0;
+static esp_reset_reason_t bt_reset_reason = ESP_RST_UNKNOWN;
 
 // ===== BLE =====
 uint16_t conn_handle;
@@ -35,10 +48,68 @@ void str_trim(char *s) {
     *(end + 1) = '\0';
 }
 
+static const char *reset_reason_text(esp_reset_reason_t reason) {
+    switch (reason) {
+        case ESP_RST_POWERON: return "POWER_ON";
+        case ESP_RST_EXT: return "EXTERNAL";
+        case ESP_RST_SW: return "SOFTWARE";
+        case ESP_RST_PANIC: return "PANIC";
+        case ESP_RST_INT_WDT: return "INT_WDT";
+        case ESP_RST_TASK_WDT: return "TASK_WDT";
+        case ESP_RST_WDT: return "WDT";
+        case ESP_RST_DEEPSLEEP: return "DEEP_SLEEP";
+        case ESP_RST_BROWNOUT: return "BROWNOUT";
+        case ESP_RST_SDIO: return "SDIO";
+        default: return "UNKNOWN";
+    }
+}
+
+static void emit_session_evidence(const char *event, int status_code) {
+    if (conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        return;
+    }
+
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    const int64_t uptime_ms = now_ms - bt_boot_time_ms;
+
+    char msg[196];
+    snprintf(
+        msg,
+        sizeof(msg),
+        "SESSION_EVIDENCE:DEV=VEST;EV=%s;UP=%lld;DC=%lu;ST=%d;AO=%d;SL=%d;NV=%lu;OD=%lu;NVS=%lld",
+        event,
+        (long long) uptime_ms,
+        (unsigned long) bt_disconnect_count,
+        status_code,
+        appOverrideActive ? 1 : 0,
+        systemPowerLockedOff ? 1 : 0,
+        (unsigned long) nv_sample_count,
+        (unsigned long) nv_object_detect_count,
+        (long long) nv_last_sample_ms
+    );
+    ble_send(msg);
+}
+
 // ===== HARDWARE =====
 void updateLEDs() {
     gpio_set_level(MOSFET1_PIN, hapticsOn);
     gpio_set_level(MOSFET2_PIN, sensorsOn);
+}
+
+static bool read_haptics_switch_state(void) {
+    // BTN pins use pull-up inputs, so logical ON is active-low.
+    return !gpio_get_level(BTN1_PIN);
+}
+
+static bool read_sensors_switch_state(void) {
+    // BTN pins use pull-up inputs, so logical ON is active-low.
+    return !gpio_get_level(BTN2_PIN);
+}
+
+static void sync_outputs_to_physical_switches(void) {
+    hapticsOn = read_haptics_switch_state();
+    sensorsOn = read_sensors_switch_state();
+    updateLEDs();
 }
 
 // calling battery reading from non_visual
@@ -49,6 +120,31 @@ void ble_send(const char *msg) {
     if (conn_handle != BLE_HS_CONN_HANDLE_NONE) {
         struct os_mbuf *om = ble_hs_mbuf_from_flat(msg, strlen(msg));
         ble_gatts_notify_custom(conn_handle, char_handle, om);
+    }
+}
+
+static const char *on_off_text(bool value) {
+    return value ? "ON" : "OFF";
+}
+
+static void send_app_toggle_mismatch(const char *target, bool appStateOn, bool physicalStateOn) {
+    if (appStateOn == physicalStateOn) {
+        return;
+    }
+
+    char msg[64];
+    snprintf(msg, sizeof(msg), "APP_TOGGLE_MISMATCH:%s:%s:%s",
+             target, on_off_text(appStateOn), on_off_text(physicalStateOn));
+    ble_send(msg);
+}
+
+static void report_app_toggle_mismatches(bool checkHaptics, bool checkSensors) {
+    if (checkHaptics) {
+        send_app_toggle_mismatch("HAPTICS", hapticsOn, read_haptics_switch_state());
+    }
+
+    if (checkSensors) {
+        send_app_toggle_mismatch("SENSORS", sensorsOn, read_sensors_switch_state());
     }
 }
 
@@ -72,31 +168,68 @@ void requestGlassesConfirmation(PendingAction action) {
 
 // ===== COMMAND PROCESSING =====
 void processCommand(char *cmd) {
+    bool checkHapticsMismatch = false;
+    bool checkSensorsMismatch = false;
+
     str_trim(cmd);
     str_to_upper(cmd);
 
     ESP_LOGI(TAG, "CMD: %s", cmd);
 
-    if (strcmp(cmd, "TURN HAPTICS ON") == 0) {
+    if (strcmp(cmd, "APP_CONNECTED") == 0) {
+        reportSystemState();
+        return;
+    }
+    else if (strcmp(cmd, "TURN SYSTEM ON") == 0) {
+        appOverrideActive = true;
+        systemPowerLockedOff = false;
+    }
+    else if (strcmp(cmd, "TURN SYSTEM OFF") == 0) {
+        appOverrideActive = true;
+        systemPowerLockedOff = true;
+        hapticsOn = false;
+        sensorsOn = false;
+    }
+    else if (systemPowerLockedOff &&
+            (strcmp(cmd, "TURN HAPTICS ON") == 0 || strcmp(cmd, "TURN SENSORS ON") == 0)) {
+        ble_send("SYSTEM_POWER_LOCK_ACTIVE");
+        reportSystemState();
+        return;
+    }
+    else if (strcmp(cmd, "TURN HAPTICS ON") == 0) {
+        appOverrideActive = true;
         hapticsOn = true;
+        checkHapticsMismatch = true;
     }
     else if (strcmp(cmd, "TURN HAPTICS OFF") == 0) {
+        appOverrideActive = true;
         hapticsOn = false;
+        checkHapticsMismatch = true;
     }
     else if (strcmp(cmd, "TURN SENSORS ON") == 0) {
+        appOverrideActive = true;
         sensorsOn = true;
+        checkSensorsMismatch = true;
     }
     else if (strcmp(cmd, "TURN SENSORS OFF") == 0) {
+        appOverrideActive = true;
         requestGlassesConfirmation(TURN_SENSORS_OFF);
         return;
     }
     else if (strcmp(cmd, "TURN ALL OFF") == 0) {
+        appOverrideActive = true;
+        systemPowerLockedOff = true;
         requestGlassesConfirmation(TURN_BOTH_OFF);
+        return;
+    }
+    else {
+        ble_send("UNKNOWN RESPONSE");
         return;
     }
 
     updateLEDs();
     reportSystemState();
+    report_app_toggle_mismatches(checkHapticsMismatch, checkSensorsMismatch);
 }
 
 // ===== BLE WRITE CALLBACK =====
@@ -114,6 +247,9 @@ static int ble_write_cb(uint16_t conn_handle_in,
     str_trim(buffer);
 
     if (awaitingGlassesResponse) {
+        bool checkHapticsMismatch = false;
+        bool checkSensorsMismatch = false;
+
         str_to_lower(buffer);
 
         if (strcmp(buffer, "glasses are on") == 0) {
@@ -123,15 +259,20 @@ static int ble_write_cb(uint16_t conn_handle_in,
             if (pendingAction == TURN_SENSORS_OFF) {
                 sensorsOn = false;
                 ble_send("SENSORS OFF");
+                checkSensorsMismatch = true;
             }
             else if (pendingAction == TURN_BOTH_OFF) {
                 sensorsOn = false;
                 hapticsOn = false;
+                systemPowerLockedOff = true;
                 ble_send("ALL OFF");
+                checkHapticsMismatch = true;
+                checkSensorsMismatch = true;
             }
 
             updateLEDs();
             reportSystemState();
+            report_app_toggle_mismatches(checkHapticsMismatch, checkSensorsMismatch);
 
             awaitingGlassesResponse = false;
             pendingAction = NONE;
@@ -169,13 +310,39 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
 static int ble_gap_event(struct ble_gap_event *event, void *arg) {
     switch (event->type) {
         case BLE_GAP_EVENT_CONNECT:
-            conn_handle = event->connect.conn_handle;
-            ESP_LOGI(TAG, "Connected");
+            if (event->connect.status == 0) {
+                conn_handle = event->connect.conn_handle;
+                ESP_LOGI(TAG, "Connected (handle=%d)", conn_handle);
+
+                char boot_msg[96];
+                snprintf(
+                    boot_msg,
+                    sizeof(boot_msg),
+                    "SESSION_EVIDENCE:DEV=VEST;EV=BOOT;RR=%s;UP=0",
+                    reset_reason_text(bt_reset_reason)
+                );
+                ble_send(boot_msg);
+                emit_session_evidence("BLE_CONNECT", event->connect.status);
+            } else {
+                conn_handle = BLE_HS_CONN_HANDLE_NONE;
+                ESP_LOGW(TAG, "Connect failed (status=%d)", event->connect.status);
+            }
             break;
 
         case BLE_GAP_EVENT_DISCONNECT:
-            ESP_LOGI(TAG, "Disconnected");
+            bt_disconnect_count++;
+            ESP_LOGI(
+                TAG,
+                "Disconnected (reason=%d, total_disconnects=%lu)",
+                event->disconnect.reason,
+                (unsigned long) bt_disconnect_count
+            );
             conn_handle = BLE_HS_CONN_HANDLE_NONE;
+            awaitingGlassesResponse = false;
+            pendingAction = NONE;
+            appOverrideActive = false;
+            systemPowerLockedOff = false;
+            sync_outputs_to_physical_switches();
             break;
     }
     return 0;
@@ -240,52 +407,62 @@ void init_bt(void) {
     // ==== BT COMMS TASK ====
 void bt_comms_task(void *pvParameters) {
     // Sync initial state with physical switch positions at boot
-    hapticsOn = !gpio_get_level(BTN1_PIN);
-    sensorsOn = !gpio_get_level(BTN2_PIN);
-    updateLEDs();
+    appOverrideActive = false;
+    systemPowerLockedOff = false;
+    bt_boot_time_ms = esp_timer_get_time() / 1000;
+    bt_last_heartbeat_ms = bt_boot_time_ms;
+    bt_reset_reason = esp_reset_reason();
+
+    ESP_LOGI(TAG, "Phase6 session bootstrap reset_reason=%s", reset_reason_text(bt_reset_reason));
+
+    sync_outputs_to_physical_switches();
     reportSystemState();
 
     while (1) {
 
-        // Switch 1 - haptics
-        bool switch1 = gpio_get_level(BTN1_PIN);
-        if (switch1 != hapticsOn) {
-            hapticsOn = switch1;
-            ble_send(hapticsOn ? "HAPTICS ON" : "HAPTICS OFF");
-            updateLEDs();
-            reportSystemState();
-        }
+        bool switch1 = read_haptics_switch_state();
+        bool switch2 = read_sensors_switch_state();
 
-/*        // Switch 2 - sensors
-        bool switch2 = gpio_get_level(BTN2_PIN);
-        if (switch2 != sensorsOn) {
-            if (!switch2) {
-                requestGlassesConfirmation(TURN_SENSORS_OFF);
-                S1 = 0.0f; S2 = 0.0f; S3 = 0.0f; S4 = 0.0f;
-
-            } else {
-                sensorsOn = switch2;
-                ble_send(sensorsOn ? "SENSORS ON" : "SENSORS OFF");
+        // System-power lock keeps outputs off while BLE stays connected.
+        if (systemPowerLockedOff) {
+            if (hapticsOn || sensorsOn) {
+                hapticsOn = false;
+                sensorsOn = false;
                 updateLEDs();
                 reportSystemState();
             }
         }
-*/
-        //Switch 2 - sensors
-        bool switch2 = !gpio_get_level(BTN2_PIN);
-        if (switch2 != sensorsOn) {
-            sensorsOn = switch2;
-            ble_send(sensorsOn ? "SENSORS ON" : "SENSORS OFF");
-            updateLEDs();
-            reportSystemState();
+        // While override is active, app commands are authoritative and
+        // physical switches are observed only for diagnostics.
+        else if (!appOverrideActive) {
+            bool changed = false;
+
+            if (switch1 != hapticsOn) {
+                hapticsOn = switch1;
+                ble_send(hapticsOn ? "HAPTICS ON" : "HAPTICS OFF");
+                changed = true;
+            }
+
+            if (switch2 != sensorsOn) {
+                sensorsOn = switch2;
+                ble_send(sensorsOn ? "SENSORS ON" : "SENSORS OFF");
+                changed = true;
+            }
+
+            if (changed) {
+                updateLEDs();
+                reportSystemState();
+            }
         }
 
         // Debug - remove after testing
-        printf("SW1:%d SW2:%d hapticsOn:%d sensorsOn:%d\n", 
-            gpio_get_level(BTN1_PIN), 
-            gpio_get_level(BTN2_PIN),
+        printf("SW1:%d SW2:%d hapticsOn:%d sensorsOn:%d override:%d sysLock:%d\n", 
+            switch1,
+            switch2,
             hapticsOn, 
-            sensorsOn);
+            sensorsOn,
+            appOverrideActive,
+            systemPowerLockedOff);
         
         // Battery every 5s
         static int64_t last = 0;
@@ -297,6 +474,11 @@ void bt_comms_task(void *pvParameters) {
             char msg[50];
             sprintf(msg, "BATTERY:%d", (int)battery_percentage);
             ble_send(msg);
+        }
+
+        if (conn_handle != BLE_HS_CONN_HANDLE_NONE && (now - bt_last_heartbeat_ms) > 60000) {
+            bt_last_heartbeat_ms = now;
+            emit_session_evidence("HEARTBEAT", 0);
         }
 
         // Glasses capture with 3s cooldown to prevent spamming

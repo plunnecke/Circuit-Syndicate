@@ -5,6 +5,7 @@
   ],
   "idf.portWin": "COM9",
   "idf.currentSetup": "C:\\esp\\v5.5.2\\esp-idf",
+  "idf.buildPath": "build",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32"
   },
@@ -12,7 +13,7 @@
   "clangd.arguments": [
     "--background-index",
     "--query-driver=**",
-    "--compile-commands-dir=c:\\ESP_Projects\\BVI_enmasse\\build"
+    "--compile-commands-dir=c:\\Users\\Me\\Downloads\\Circuit-Syndicate1\\Control Box\\build"
   ],
   "idf.flashType": "UART"
 }

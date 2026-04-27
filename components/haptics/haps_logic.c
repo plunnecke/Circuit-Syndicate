@@ -19,7 +19,7 @@ int haptic_pins[NUM_HAPTICS] = {18, 17, 16, 4};
 
 int get_tier(float dist) {
     if (dist <= NO_READING) return 0;
-    if (dist == 2.0) return 1;
+    if (dist <= 2.0) return 1;
     if (dist == 3.0) return 2;
     if (dist == 4.0) return 3;
     if (dist == 5.0) return 4;
@@ -64,14 +64,28 @@ void set_haptic(int motor, uint32_t duty) {
 void haptic_task_1(void *pvParameters) {
     int tier;
     int off_delay;
+    int consecutive = 0;
+    bool active = false;
     while (1) {
         if (!hapticsOn) {
             set_haptic(0, 0);
+            consecutive = 0;
+            active = false;
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
         tier = get_tier(S1);
-        if (tier == 0) {
+        if (tier == 5) {
+            consecutive++;
+            if (consecutive >= 2) active = true;
+        } else if (tier > 0) {
+            consecutive = 0;
+            active = true;
+        } else {
+            consecutive = 0;
+            active = false;
+        }
+        if (!active) {
             set_haptic(0, 0);
             vTaskDelay(pdMS_TO_TICKS(50));
         } else {
@@ -93,14 +107,28 @@ void haptic_task_1(void *pvParameters) {
 void haptic_task_2(void *pvParameters) {
     int tier;
     int off_delay;
+    int consecutive = 0;
+    bool active = false;
     while (1) {
         if (!hapticsOn) {
             set_haptic(1, 0);
+            consecutive = 0;
+            active = false;
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
         tier = get_tier(S2);
-        if (tier == 0) {
+        if (tier == 5) {
+            consecutive++;
+            if (consecutive >= 2) active = true;
+        } else if (tier > 0) {
+            consecutive = 0;
+            active = true;
+        } else {
+            consecutive = 0;
+            active = false;
+        }
+        if (!active) {
             set_haptic(1, 0);
             vTaskDelay(pdMS_TO_TICKS(50));
         } else {
@@ -122,14 +150,28 @@ void haptic_task_2(void *pvParameters) {
 void haptic_task_3(void *pvParameters) {
     int tier;
     int off_delay;
+    int consecutive = 0;
+    bool active = false;
     while (1) {
         if (!hapticsOn) {
             set_haptic(2, 0);
+            consecutive = 0;
+            active = false;
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
         tier = get_tier(S3);
-        if (tier == 0) {
+        if (tier == 5) {
+            consecutive++;
+            if (consecutive >= 2) active = true;
+        } else if (tier > 0) {
+            consecutive = 0;
+            active = true;
+        } else {
+            consecutive = 0;
+            active = false;
+        }
+        if (!active) {
             set_haptic(2, 0);
             vTaskDelay(pdMS_TO_TICKS(50));
         } else {
@@ -142,7 +184,6 @@ void haptic_task_3(void *pvParameters) {
     }
 }
 
-
 // ============================================================
 //  HAPTIC TASK - H4
 //  Reads S4, pulses H4 at rate determined by tier
@@ -152,14 +193,28 @@ void haptic_task_3(void *pvParameters) {
 void haptic_task_4(void *pvParameters) {
     int tier;
     int off_delay;
+    int consecutive = 0;
+    bool active = false;
     while (1) {
         if (!hapticsOn) {
             set_haptic(3, 0);
+            consecutive = 0;
+            active = false;
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
         tier = get_tier(S4);
-        if (tier == 0) {
+        if (tier == 5) {
+            consecutive++;
+            if (consecutive >= 2) active = true;
+        } else if (tier > 0) {
+            consecutive = 0;
+            active = true;
+        } else {
+            consecutive = 0;
+            active = false;
+        }
+        if (!active) {
             set_haptic(3, 0);
             vTaskDelay(pdMS_TO_TICKS(50));
         } else {
