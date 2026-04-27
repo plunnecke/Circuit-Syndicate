@@ -1,0 +1,10 @@
+# Generated Android/Gradle artifacts
+/.gradle/
+/build/
+/tmp/
+
+# Local machine config
+/local.properties
+
+# Local Python environment
+/.venv/

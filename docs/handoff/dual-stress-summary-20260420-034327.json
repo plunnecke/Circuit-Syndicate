@@ -1,0 +1,15 @@
+{
+  "startedUtc": "2026-04-20T07:43:27.1486108Z",
+  "endedUtc": "2026-04-20T07:43:57.9030621Z",
+  "packageName": "com.circuitsyndicate.findingtheway",
+  "durationMinutes": 2,
+  "throttleMs": 250,
+  "monkeyEvents": 480,
+  "logFile": "docs\\handoff\\dual-stress-20260420-034327.log",
+  "fatalCount": 0,
+  "vestSignalCount": 0,
+  "glassesSignalCount": 0,
+  "passNoCrash": true,
+  "passDualSignals": false,
+  "pass": false
+}
