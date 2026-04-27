@@ -4,26 +4,15 @@ import java.util.concurrent.CopyOnWriteArrayList
 
 object ObjectHistory {
 
-    private const val MAX_HISTORY_ITEMS = 100
-    private val historyItems = CopyOnWriteArrayList<String>()
+    private const val MAX = 100
+    private val history = CopyOnWriteArrayList<String>()
 
     fun addDetection(detection: String) {
-        historyItems.add(0, detection)
-
-        while (historyItems.size > MAX_HISTORY_ITEMS) {
-            historyItems.removeAt(historyItems.lastIndex)
-        }
+        history.add(0, detection)
+        while (history.size > MAX) history.removeAt(history.size - 1)
     }
 
-    fun getHistory(): List<String> {
-        return historyItems.toList()
-    }
-
-    fun getLastDetection(): String? {
-        return historyItems.firstOrNull()
-    }
-
-    fun clear() {
-        historyItems.clear()
-    }
+    fun getHistory(): List<String> = history.toList()
+    fun getLastDetection(): String? = history.firstOrNull()
+    fun clear() = history.clear()
 }

@@ -1,7 +1,12 @@
 package com.circuitsyndicate.findingtheway
 
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import com.circuitsyndicate.findingtheway.storage.ImageStorageManager
 
@@ -19,7 +24,6 @@ import com.circuitsyndicate.findingtheway.storage.ImageStorageManager
  *     "BOTH_BUTTONS_OFF"         hapticsOn=false, sensorsOn=false
  *     "HAPTICS_ON_SENSORS_OFF"   hapticsOn=true,  sensorsOn=false
  *     "HAPTICS_OFF_SENSORS_ON"   hapticsOn=false, sensorsOn=true
- *     "SYSTEM_POWER_LOCK_ACTIVE" system lock is OFF, subsystem enable command denied
  *   Button press state (sent immediately, then reportSystemState() follows):
  *     "HAPTICS:ON"   "HAPTICS:OFF"   "SENSORS:ON"
  *   After safety check:
@@ -53,21 +57,26 @@ class VestMessageHandler(
 
     companion object {
         private const val TAG = "VestMessageHandler"
-        private const val AUTO_SINGLE_CAPTURE_MIN_INTERVAL_MS = 5_000L
+        private const val AUTO_BURST_RETRY_MS = 300L
+        private const val AUTO_BURST_IN_FLIGHT_TIMEOUT_MS = 15_000L
+        private const val MAX_PENDING_AUTO_BURST_REQUESTS = 1
+        private const val AUTO_BURST_COOLDOWN_MS = 15_000L
+        private const val AUTO_BURST_TRIGGER_WINDOW_MS = 8_000L
+        private const val AUTO_BURST_REQUIRED_TRIGGER_COUNT = 2
+        private const val AUTO_BURST_CONTINUOUS_DETECTION_MS = 8_000L
+        private const val AUTO_BURST_TRIGGER_GAP_RESET_MS = 5_000L
     }
 
     interface GlassesCaptureGateway {
         fun isConnected(): Boolean
         fun isCaptureEnabled(): Boolean
-        fun isCapturePipelineBusy(): Boolean
-        fun takePhoto(): Boolean
+        fun takeBurst(): Boolean
     }
 
     private object DefaultGlassesCaptureGateway : GlassesCaptureGateway {
         override fun isConnected(): Boolean = GlassesCommandSender.isConnected()
         override fun isCaptureEnabled(): Boolean = GlassesCommandSender.isCaptureEnabled()
-        override fun isCapturePipelineBusy(): Boolean = GlassesCommandSender.isCapturePipelineBusy()
-        override fun takePhoto(): Boolean = GlassesCommandSender.takePhoto()
+        override fun takeBurst(): Boolean = GlassesCommandSender.takeBurst()
     }
 
     data class VestState(
@@ -93,8 +102,28 @@ class VestMessageHandler(
     private var imageBuffer: ByteArray? = null
     private var receivingImage = false
     private val imageStorage by lazy { ImageStorageManager.getInstance(context) }
-    private val autoCaptureStateLock = Any()
-    private var lastAutoSingleCaptureAtMs = 0L
+    private val autoBurstHandler = Handler(Looper.getMainLooper())
+    private val autoBurstStateLock = Any()
+    private var pendingAutoBurstRequests = 0
+    private var autoBurstInFlight = false
+    private var autoBurstInFlightSinceMs = 0L
+    private var autoBurstRetryScheduled = false
+    private var autoBurstImmediateTriggerArmed = false
+    private val recentAutoBurstTriggerTimesMs = java.util.ArrayDeque<Long>()
+    private var autoBurstTriggerStreakStartMs = 0L
+    private var lastAutoBurstTriggerMs = 0L
+    private var autoBurstCooldownUntilMs = 0L
+
+    private val burstTimingReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != GlassesImagePipeline.ACTION_BURST_TIMING_UPDATED) return
+            onAutoBurstCompleted("pipeline_burst_timing")
+        }
+    }
+
+    init {
+        registerBurstTimingReceiver()
+    }
 
     // ── Listener management ───────────────────────────────────────────────────
 
@@ -121,7 +150,7 @@ class VestMessageHandler(
                 state.systemOn  = true
                 state.hapticsOn = true   // firmware initialises both ON
                 state.sensorsOn = true
-                resetAutoSingleCaptureThrottle("vest_connected", allowImmediateCapture = true)
+                resetAutoBurstQueueState("vest_connected", armImmediateTrigger = true)
                 notifyListeners { it.onConnectionChanged(true) }
                 InteractionLogger.logConnection("VEST", true)
                 notifyStateChanged()
@@ -130,7 +159,7 @@ class VestMessageHandler(
                 state.systemOn  = false
                 state.hapticsOn = false
                 state.sensorsOn = false
-                resetAutoSingleCaptureThrottle("vest_disconnected")
+                resetAutoBurstQueueState("vest_disconnected")
                 notifyListeners { it.onConnectionChanged(false) }
                 InteractionLogger.logConnection("VEST", false)
                 notifyStateChanged()
@@ -157,18 +186,15 @@ class VestMessageHandler(
                 state.systemOn  = true
                 state.hapticsOn = true
                 state.sensorsOn = true
-                resetAutoSingleCaptureThrottle("both_buttons_on", allowImmediateCapture = true)
+                resetAutoBurstQueueState("both_buttons_on", armImmediateTrigger = true)
                 InteractionLogger.logStateChange("HAPTICS+SENSORS", true, "VEST")
                 notifyStateChanged()
             }
             msg == "BOTH_BUTTONS_OFF" -> {
+                state.systemOn  = false
                 state.hapticsOn = false
                 state.sensorsOn = false
-                // Preserve explicit system-power intent. BOTH_BUTTONS_OFF can also
-                // mean both subsystems were turned off individually while system power
-                // remains logically enabled.
-                state.systemOn = DeviceManager.isVestSystemEnabled()
-                resetAutoSingleCaptureThrottle("both_buttons_off")
+                resetAutoBurstQueueState("both_buttons_off")
                 InteractionLogger.logStateChange("HAPTICS+SENSORS", false, "VEST")
                 notifyStateChanged()
             }
@@ -176,30 +202,22 @@ class VestMessageHandler(
                 state.systemOn  = true
                 state.hapticsOn = true
                 state.sensorsOn = false
-                resetAutoSingleCaptureThrottle("sensors_off")
+                resetAutoBurstQueueState("sensors_off")
                 notifyStateChanged()
             }
             msg == "HAPTICS_OFF_SENSORS_ON" -> {
                 state.systemOn  = true
                 state.hapticsOn = false
                 state.sensorsOn = true
-                resetAutoSingleCaptureThrottle("sensors_on", allowImmediateCapture = true)
+                resetAutoBurstQueueState("sensors_on", armImmediateTrigger = true)
                 notifyStateChanged()
             }
             msg == "ALL OFF" -> {
                 state.systemOn  = false
                 state.hapticsOn = false
                 state.sensorsOn = false
-                resetAutoSingleCaptureThrottle("all_off")
+                resetAutoBurstQueueState("all_off")
                 InteractionLogger.logStateChange("HAPTICS+SENSORS", false, "VEST")
-                notifyStateChanged()
-            }
-            msg == "SYSTEM_POWER_LOCK_ACTIVE" -> {
-                state.systemOn = false
-                state.hapticsOn = false
-                state.sensorsOn = false
-                resetAutoSingleCaptureThrottle("system_power_lock_active")
-                InteractionLogger.logStateChange("SYSTEM", false, "VEST")
                 notifyStateChanged()
             }
 
@@ -216,13 +234,13 @@ class VestMessageHandler(
             }
             msg == "SENSORS:ON" || msg == "SENSORS ON" -> {
                 state.sensorsOn = true
-                resetAutoSingleCaptureThrottle("sensors_on", allowImmediateCapture = true)
+                resetAutoBurstQueueState("sensors_on", armImmediateTrigger = true)
                 InteractionLogger.logStateChange("SENSORS", true, "VEST")
                 notifyStateChanged()
             }
             msg == "SENSORS ARE NOW OFF" || msg == "SENSORS OFF" -> {
                 state.sensorsOn = false
-                resetAutoSingleCaptureThrottle("sensors_off")
+                resetAutoBurstQueueState("sensors_off")
                 InteractionLogger.logStateChange("SENSORS", false, "VEST")
                 notifyStateChanged()
             }
@@ -321,12 +339,15 @@ class VestMessageHandler(
 
     fun onCaptureGateChanged(enabled: Boolean, source: String = "APP") {
         if (enabled) {
-            resetAutoSingleCaptureThrottle(
+            resetAutoBurstQueueState(
                 reason = "capture_enabled:$source",
-                allowImmediateCapture = true
+                armImmediateTrigger = true
             )
         } else {
-            resetAutoSingleCaptureThrottle(reason = "capture_disabled:$source")
+            resetAutoBurstQueueState(
+                reason = "capture_disabled:$source",
+                armImmediateTrigger = false
+            )
         }
     }
 
@@ -350,72 +371,207 @@ class VestMessageHandler(
         })
     }
 
+    private fun registerBurstTimingReceiver() {
+        val filter = IntentFilter(GlassesImagePipeline.ACTION_BURST_TIMING_UPDATED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(burstTimingReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            context.registerReceiver(burstTimingReceiver, filter)
+        }
+    }
+
     private fun handleGlassesCaptureTrigger() {
         if (!state.systemOn || !state.sensorsOn) {
-            resetAutoSingleCaptureThrottle("sensors_or_system_off")
+            resetAutoBurstQueueState("sensors_or_system_off")
             Log.d(TAG, "GLASSES_CAPTURE ignored while vest sensors/system are off")
             return
         }
 
         if (!glassesCaptureGateway.isConnected()) {
-            resetAutoSingleCaptureThrottle("glasses_disconnected")
+            resetAutoBurstQueueState("glasses_disconnected")
             Log.d(TAG, "GLASSES_CAPTURE received while glasses are disconnected")
             return
         }
 
         if (!glassesCaptureGateway.isCaptureEnabled()) {
-            resetAutoSingleCaptureThrottle("capture_disabled")
+            resetAutoBurstQueueState("capture_disabled")
             Log.d(TAG, "GLASSES_CAPTURE ignored because glasses capture is disabled")
             return
         }
 
-        if (glassesCaptureGateway.isCapturePipelineBusy()) {
-            Log.d(TAG, "GLASSES_CAPTURE deferred while prior capture is still processing")
-            return
-        }
-
         val now = System.currentTimeMillis()
-        val (sent, waitRemainingMs) = synchronized(autoCaptureStateLock) {
-            val elapsedMs = now - lastAutoSingleCaptureAtMs
-            if (lastAutoSingleCaptureAtMs > 0L && elapsedMs < AUTO_SINGLE_CAPTURE_MIN_INTERVAL_MS) {
-                Pair(false, AUTO_SINGLE_CAPTURE_MIN_INTERVAL_MS - elapsedMs)
-            } else {
-                val dispatched = glassesCaptureGateway.takePhoto()
-                if (dispatched) {
-                    lastAutoSingleCaptureAtMs = now
-                }
-                Pair(dispatched, null)
-            }
+        val shouldDispatch = synchronized(autoBurstStateLock) {
+            shouldDispatchAutoBurstForTriggerLocked(now)
         }
 
-        if (waitRemainingMs != null) {
-            Log.d(
-                TAG,
-                "GLASSES_CAPTURE throttled; next single-photo command allowed in ${waitRemainingMs}ms"
-            )
+        if (!shouldDispatch) {
             return
         }
 
-        if (sent) {
-            Log.d(TAG, "GLASSES_CAPTURE dispatched single-photo command")
-        } else {
-            Log.w(TAG, "GLASSES_CAPTURE single-photo command dispatch failed")
+        enqueueAutoBurstRequest()
+    }
+
+    private fun shouldDispatchAutoBurstForTriggerLocked(nowMs: Long): Boolean {
+        if (autoBurstImmediateTriggerArmed) {
+            autoBurstImmediateTriggerArmed = false
+            recentAutoBurstTriggerTimesMs.clear()
+            autoBurstTriggerStreakStartMs = nowMs
+            lastAutoBurstTriggerMs = nowMs
+            return true
+        }
+
+        if (lastAutoBurstTriggerMs <= 0L ||
+            nowMs - lastAutoBurstTriggerMs > AUTO_BURST_TRIGGER_GAP_RESET_MS
+        ) {
+            autoBurstTriggerStreakStartMs = nowMs
+            recentAutoBurstTriggerTimesMs.clear()
+        }
+
+        lastAutoBurstTriggerMs = nowMs
+        if (autoBurstTriggerStreakStartMs <= 0L) {
+            autoBurstTriggerStreakStartMs = nowMs
+        }
+
+        recentAutoBurstTriggerTimesMs.addLast(nowMs)
+        while (recentAutoBurstTriggerTimesMs.isNotEmpty()) {
+            val ageMs = nowMs - (recentAutoBurstTriggerTimesMs.peekFirst() ?: nowMs)
+            if (ageMs <= AUTO_BURST_TRIGGER_WINDOW_MS) break
+            recentAutoBurstTriggerTimesMs.removeFirst()
+        }
+
+        if (nowMs < autoBurstCooldownUntilMs) {
+            return false
+        }
+
+        val triggerCount = recentAutoBurstTriggerTimesMs.size
+        val streakDurationMs = (nowMs - autoBurstTriggerStreakStartMs).coerceAtLeast(0L)
+        val qualifiesByCount = triggerCount >= AUTO_BURST_REQUIRED_TRIGGER_COUNT
+        val qualifiesByDuration = streakDurationMs >= AUTO_BURST_CONTINUOUS_DETECTION_MS
+
+        if (!qualifiesByCount && !qualifiesByDuration) {
+            return false
+        }
+
+        recentAutoBurstTriggerTimesMs.clear()
+        autoBurstTriggerStreakStartMs = nowMs
+        return true
+    }
+
+    private fun enqueueAutoBurstRequest() {
+        synchronized(autoBurstStateLock) {
+            if (pendingAutoBurstRequests >= MAX_PENDING_AUTO_BURST_REQUESTS) {
+                // Keep one pending request while in-flight to avoid stale burst backlogs.
+                Log.d(TAG, "Auto burst trigger coalesced while request is pending")
+                return
+            }
+            pendingAutoBurstRequests += 1
+        }
+        drainAutoBurstQueue("vest_trigger")
+    }
+
+    private fun onAutoBurstCompleted(source: String) {
+        synchronized(autoBurstStateLock) {
+            if (!autoBurstInFlight) return
+            autoBurstInFlight = false
+            autoBurstInFlightSinceMs = 0L
+        }
+        drainAutoBurstQueue(source)
+    }
+
+    private fun resetAutoBurstQueueState(reason: String, armImmediateTrigger: Boolean = false) {
+        synchronized(autoBurstStateLock) {
+            pendingAutoBurstRequests = 0
+            autoBurstInFlight = false
+            autoBurstInFlightSinceMs = 0L
+            autoBurstRetryScheduled = false
+            resetAutoBurstTriggerHistoryLocked()
+            autoBurstImmediateTriggerArmed = armImmediateTrigger
+        }
+        autoBurstHandler.removeCallbacksAndMessages(null)
+        Log.d(TAG, "Auto burst queue reset: $reason")
+    }
+
+    private fun resetAutoBurstTriggerHistoryLocked() {
+        recentAutoBurstTriggerTimesMs.clear()
+        autoBurstTriggerStreakStartMs = 0L
+        lastAutoBurstTriggerMs = 0L
+        autoBurstCooldownUntilMs = 0L
+    }
+
+    private fun drainAutoBurstQueue(trigger: String) {
+        synchronized(autoBurstStateLock) {
+            val now = System.currentTimeMillis()
+
+            if (autoBurstInFlight) {
+                val inFlightAgeMs = now - autoBurstInFlightSinceMs
+                if (autoBurstInFlightSinceMs > 0L && inFlightAgeMs > AUTO_BURST_IN_FLIGHT_TIMEOUT_MS) {
+                    Log.w(TAG, "Auto burst in-flight timeout after ${inFlightAgeMs}ms; recovering queue")
+                    autoBurstInFlight = false
+                    autoBurstInFlightSinceMs = 0L
+                } else {
+                    return
+                }
+            }
+
+            if (pendingAutoBurstRequests <= 0) {
+                return
+            }
+
+            if (now < autoBurstCooldownUntilMs) {
+                scheduleAutoBurstRetryLocked(
+                    reason = "cooldown_active",
+                    delayMs = (autoBurstCooldownUntilMs - now).coerceAtLeast(AUTO_BURST_RETRY_MS)
+                )
+                return
+            }
+
+            if (!glassesCaptureGateway.isConnected()) {
+                scheduleAutoBurstRetryLocked("glasses_disconnected")
+                return
+            }
+
+            if (!glassesCaptureGateway.isCaptureEnabled()) {
+                Log.w(TAG, "Auto burst request blocked because glasses capture is disabled")
+                pendingAutoBurstRequests = 0
+                autoBurstRetryScheduled = false
+                autoBurstInFlight = false
+                autoBurstInFlightSinceMs = 0L
+                resetAutoBurstTriggerHistoryLocked()
+                return
+            }
+
+            val sent = glassesCaptureGateway.takeBurst()
+            if (sent) {
+                pendingAutoBurstRequests -= 1
+                autoBurstInFlight = true
+                autoBurstInFlightSinceMs = now
+                autoBurstRetryScheduled = false
+                autoBurstCooldownUntilMs = now + AUTO_BURST_COOLDOWN_MS
+                Log.d(
+                    TAG,
+                    "Auto burst dispatched (trigger=$trigger, pending=$pendingAutoBurstRequests)"
+                )
+                return
+            }
+
+            Log.w(TAG, "Auto burst dispatch failed (trigger=$trigger); retrying")
+            scheduleAutoBurstRetryLocked("dispatch_failed")
         }
     }
 
-    private fun resetAutoSingleCaptureThrottle(
-        reason: String,
-        allowImmediateCapture: Boolean = false
-    ) {
-        synchronized(autoCaptureStateLock) {
-            if (allowImmediateCapture) {
-                lastAutoSingleCaptureAtMs = 0L
-            }
+    private fun scheduleAutoBurstRetryLocked(reason: String, delayMs: Long = AUTO_BURST_RETRY_MS) {
+        if (autoBurstRetryScheduled) {
+            return
         }
-        Log.d(
-            TAG,
-            "Auto single-capture throttle reset: $reason immediate=${if (allowImmediateCapture) 1 else 0}"
-        )
+        autoBurstRetryScheduled = true
+        autoBurstHandler.postDelayed({
+            synchronized(autoBurstStateLock) {
+                autoBurstRetryScheduled = false
+            }
+            drainAutoBurstQueue("retry")
+        }, delayMs)
+        Log.d(TAG, "Auto burst retry scheduled ($reason delay_ms=$delayMs)")
     }
 
     private fun parseToggleMismatch(msg: String): Triple<String, Boolean, Boolean>? {

@@ -8,14 +8,12 @@ import android.graphics.Rect
 import android.graphics.RectF
 import android.util.Log
 import ai.onnxruntime.*
-import java.io.ByteArrayOutputStream
-import java.io.InputStream
 import java.nio.FloatBuffer
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
-// YOLO detector helper for images coming from the glasses pipeline.
+// Implements YOLO asset for object detection within captured image(s)
 
 class ObjectDetector(
     private val context: Context,
@@ -27,45 +25,41 @@ class ObjectDetector(
         private const val PREFERRED_MODEL_ASSET = "yolov8m-oiv7.onnx"
         private val FALLBACK_MODEL_ASSETS = listOf(
             "yolov8s-oiv7.onnx",
-            "yolov8n-oiv7.onnx",
-            "yolov8l-oiv7.onnx"
+            "yolov8n-oiv7.onnx"
         )
         private const val OPEN_IMAGES_LABELS_ASSET = "openimages_v7_labels.txt"
         private const val OPEN_IMAGES_V7_CLASS_COUNT = 601
         private const val INPUT_SIZE = 640
         private const val CONFIDENCE_THRESHOLD = 0.12f
-        private const val IOU_THRESHOLD = 0.40f
-        private const val GENERIC_CLASS_SUPPRESS_IOU = 0.50f
-        private const val HIERARCHY_CLASS_SUPPRESS_IOU = 0.60f
+        private const val IOU_THRESHOLD = 0.45f
+        private const val GENERIC_CLASS_SUPPRESS_IOU = 0.55f
+        private const val HIERARCHY_CLASS_SUPPRESS_IOU = 0.65f
         private const val GENERIC_CLASS_CONFIDENCE_PENALTY = 0.03f
         private const val MOTION_TRUST_RANKING_PENALTY_WEIGHT = 0.04f
         private const val TOP_SCORE_LOG_COUNT = 5
         private const val MAX_INTRA_OP_THREADS = 4
-        private const val MODEL_ASSET_MIN_BYTES = 32L * 1024L * 1024L
-        private const val MODEL_ASSET_MAX_BYTES = 256L * 1024L * 1024L
-        private const val MODEL_ASSET_HEAP_FRACTION_DENOMINATOR = 2L
 
-        // Open Images has very broad labels too. Prefer specific labels
-        // when we can see they overlap a lot with generic ones.
+        // Open Images includes broad superclass labels. Prefer specific classes
+        // when they overlap strongly with generic class detections.
         private val GENERIC_OPEN_IMAGES_LABELS = setOf(
             "animal", "mammal", "vehicle", "land vehicle", "aircraft", "watercraft",
             "furniture", "plant", "tree", "building", "house", "food", "tool"
         )
 
-        // Kept for backward compatibility with older pipeline code.
+        // Backward-compatible label alias expected by existing pipeline code.
         @Volatile
         var LABELS: List<String> = emptyList()
             private set
     }
 
-    /** Legacy backend enum still used by settings + pipeline integration. */
+    /** Backward-compatible backend enum expected by existing settings/pipeline code. */
     enum class Backend {
         ONNX
     }
 
     /**
-     * Legacy config seam kept so existing integration code still compiles.
-     * Runtime behavior always resolves to ONNX.
+     * Backward-compatible config seam retained for integration safety.
+     * The imported legacy detector enforces ONNX at runtime.
      */
     data class Config(
         val backend: Backend = Backend.ONNX,
@@ -95,10 +89,10 @@ class ObjectDetector(
 
     private var classLabels: List<String> = emptyList()
 
-    private data class CandidateScore(val detectionIndex: Int, val classIndex: Int, val score: Float)
-    private data class ModelAssetBytes(val assetName: String, val bytes: ByteArray)
+    private data class RawScore(val detIdx: Int, val classIdx: Int, val score: Float)
+    private data class LoadedModelAsset(val assetName: String, val bytes: ByteArray)
 
-    // Reused buffers to reduce allocations and GC churn.
+    // Pre-allocated buffers, avoids repeated garbage collector calls
     private val pixelBuffer = IntArray(INPUT_SIZE * INPUT_SIZE)
     private val chwBuffer = FloatArray(3 * INPUT_SIZE * INPUT_SIZE)
     private val reusableScaledBitmap = Bitmap.createBitmap(INPUT_SIZE, INPUT_SIZE, Bitmap.Config.ARGB_8888)
@@ -122,7 +116,34 @@ class ObjectDetector(
                 )
             }
             Log.d(TAG, "Loaded model asset: $activeModelName")
-            ortSession = createOrtSession(modelBytes)
+
+            // Try NNAPI first, fall back to unoptimized CPU resources on failure
+            var session: OrtSession? = null
+            val cpuThreadCount = Runtime.getRuntime()
+                .availableProcessors()
+                .coerceIn(2, MAX_INTRA_OP_THREADS)
+            try {
+                val nnapiOptions = OrtSession.SessionOptions().apply {
+                    addNnapi()
+                    setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+                    setInterOpNumThreads(1)
+                    setIntraOpNumThreads(cpuThreadCount)
+                }
+                session = ortEnv!!.createSession(modelBytes, nnapiOptions)
+                Log.d(TAG, "NNAPI delegate enabled")
+            } catch (e: Exception) {
+                Log.w(TAG, "NNAPI failed, falling back to CPU: ${e.message}")
+                session?.close()
+                val cpuOptions = OrtSession.SessionOptions().apply {
+                    setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+                    setInterOpNumThreads(1)
+                    setIntraOpNumThreads(cpuThreadCount)
+                }
+                session = ortEnv!!.createSession(modelBytes, cpuOptions)
+                Log.d(TAG, "CPU inference enabled")
+            }
+
+            ortSession = session
             classLabels = loadOpenImagesV7Labels(context)
             LABELS = classLabels
             isInitialized = true
@@ -131,8 +152,8 @@ class ObjectDetector(
                 TAG,
                 "ObjectDetector ready (ONNX Runtime, model=$activeModelName, classes=${classLabels.size})"
             )
-        } catch (e: Throwable) {
-            Log.e(TAG, "Failed to initialize ObjectDetector: ${e.message}", e)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to initialize ObjectDetector: ${e.message}")
             isInitialized = false
             throw IllegalStateException("ObjectDetector initialization failed", e)
         }
@@ -141,102 +162,28 @@ class ObjectDetector(
     private fun loadBestAvailableModelAsset(
         context: Context,
         requestedAsset: String
-    ): ModelAssetBytes {
-        val modelCandidates = linkedSetOf(
+    ): LoadedModelAsset {
+        val candidates = linkedSetOf(
             requestedAsset,
             PREFERRED_MODEL_ASSET,
             *FALLBACK_MODEL_ASSETS.toTypedArray()
         ).filter { it.isNotBlank() }
-        val safeModelByteCap = computeModelAssetByteCap()
 
-        var lastError: Throwable? = null
-        for (assetName in modelCandidates) {
+        var lastError: Exception? = null
+        for (assetName in candidates) {
             try {
-                val bytes = readModelAssetBytes(context, assetName, safeModelByteCap)
-                return ModelAssetBytes(assetName = assetName, bytes = bytes)
-            } catch (e: Throwable) {
+                val bytes = context.assets.open(assetName).use { it.readBytes() }
+                return LoadedModelAsset(assetName = assetName, bytes = bytes)
+            } catch (e: Exception) {
                 lastError = e
                 Log.w(TAG, "Model asset $assetName unavailable: ${e.message}")
             }
         }
 
         throw IllegalStateException(
-            "No compatible ONNX model asset found. Tried: ${modelCandidates.joinToString(", ")}",
+            "No compatible ONNX model asset found. Tried: ${candidates.joinToString(", ")}",
             lastError
         )
-    }
-
-    private fun computeModelAssetByteCap(): Long {
-        val heapMax = Runtime.getRuntime().maxMemory().coerceAtLeast(1L)
-        val derivedCap = heapMax / MODEL_ASSET_HEAP_FRACTION_DENOMINATOR
-        return derivedCap.coerceIn(MODEL_ASSET_MIN_BYTES, MODEL_ASSET_MAX_BYTES)
-    }
-
-    private fun readModelAssetBytes(
-        context: Context,
-        assetName: String,
-        maxBytes: Long
-    ): ByteArray {
-        try {
-            context.assets.openFd(assetName).use { afd ->
-                val declaredSize = afd.length
-                if (declaredSize <= 0L) {
-                    throw IllegalStateException("Model asset $assetName has unknown size")
-                }
-                if (declaredSize > maxBytes) {
-                    throw IllegalStateException(
-                        "Model asset $assetName (${declaredSize} bytes) exceeds safe load cap ${maxBytes} bytes"
-                    )
-                }
-                if (declaredSize > Int.MAX_VALUE) {
-                    throw IllegalStateException("Model asset $assetName exceeds byte array limit")
-                }
-
-                return afd.createInputStream().use { stream ->
-                    readFixedSizeBytes(stream, declaredSize.toInt())
-                }
-            }
-        } catch (e: Exception) {
-            if (e is IllegalStateException) {
-                throw e
-            }
-            // Fall through to generic stream loading for compressed assets.
-        }
-
-        return context.assets.open(assetName).use { stream ->
-            val output = ByteArrayOutputStream()
-            val buffer = ByteArray(8192)
-            var totalRead = 0L
-
-            while (true) {
-                val read = stream.read(buffer)
-                if (read < 0) {
-                    break
-                }
-                totalRead += read
-                if (totalRead > maxBytes) {
-                    throw IllegalStateException(
-                        "Model asset $assetName exceeds safe load cap ${maxBytes} bytes"
-                    )
-                }
-                output.write(buffer, 0, read)
-            }
-
-            output.toByteArray()
-        }
-    }
-
-    private fun readFixedSizeBytes(stream: InputStream, expectedSize: Int): ByteArray {
-        val bytes = ByteArray(expectedSize)
-        var offset = 0
-        while (offset < expectedSize) {
-            val read = stream.read(bytes, offset, expectedSize - offset)
-            if (read < 0) {
-                throw IllegalStateException("Unexpected EOF while reading model asset")
-            }
-            offset += read
-        }
-        return bytes
     }
 
     private fun loadOpenImagesV7Labels(context: Context): List<String> {
@@ -270,87 +217,24 @@ class ObjectDetector(
 
     fun getActiveBackend(): Backend = activeBackend
 
-    fun getActiveModelAsset(): String = activeModelName
-
     @Synchronized
     fun setBackend(backend: Backend): Backend {
-        return setConfig(currentConfig.copy(backend = backend))
-    }
-
-    @Synchronized
-    fun setConfig(config: Config): Backend {
-        val resolvedConfig = config.copy(
-            backend = Backend.ONNX,
-            onnxModelAsset = config.onnxModelAsset.ifBlank { PREFERRED_MODEL_ASSET }
-        )
-
-        currentConfig = resolvedConfig
         requestedBackend = Backend.ONNX
-
-        if (!isInitialized || ortEnv == null) {
-            activeBackend = Backend.ONNX
-            return activeBackend
-        }
-
-        val reloadModelSession = resolvedConfig.onnxModelAsset != activeModelName
-        if (reloadModelSession) {
-            try {
-                val loadedModel = loadBestAvailableModelAsset(context, resolvedConfig.onnxModelAsset)
-                val replacementSession = createOrtSession(loadedModel.bytes)
-
-                ortSession?.close()
-                ortSession = replacementSession
-                activeModelName = loadedModel.assetName
-
-                Log.i(
-                    TAG,
-                    "ObjectDetector model switched to $activeModelName (requested=${resolvedConfig.onnxModelAsset})"
-                )
-            } catch (e: Throwable) {
-                Log.e(
-                    TAG,
-                    "Failed to switch detector model to ${resolvedConfig.onnxModelAsset}: ${e.message}",
-                    e
-                )
-            }
-        }
-
         activeBackend = Backend.ONNX
         return activeBackend
     }
 
-    private fun createOrtSession(modelBytes: ByteArray): OrtSession {
-        val env = ortEnv ?: throw IllegalStateException("OrtEnvironment not initialized")
-        val workerThreads = Runtime.getRuntime()
-            .availableProcessors()
-            .coerceIn(2, MAX_INTRA_OP_THREADS)
-
-        return try {
-            val nnapiOptions = OrtSession.SessionOptions().apply {
-                addNnapi()
-                setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-                setInterOpNumThreads(1)
-                setIntraOpNumThreads(workerThreads)
-            }
-            val session = env.createSession(modelBytes, nnapiOptions)
-            Log.d(TAG, "NNAPI delegate enabled")
-            session
-        } catch (e: Throwable) {
-            Log.w(TAG, "NNAPI failed, falling back to CPU: ${e.message}")
-            val cpuOptions = OrtSession.SessionOptions().apply {
-                setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-                setInterOpNumThreads(1)
-                setIntraOpNumThreads(workerThreads)
-            }
-            val session = env.createSession(modelBytes, cpuOptions)
-            Log.d(TAG, "CPU inference enabled")
-            session
-        }
+    @Synchronized
+    fun setConfig(config: Config): Backend {
+        currentConfig = config
+        requestedBackend = Backend.ONNX
+        activeBackend = Backend.ONNX
+        return activeBackend
     }
 
     /**
-     * Runs YOLO inference on one bitmap.
-     * Returns detections with normalized boxes.
+     * Run YOLO inference on a bitmap.
+     * Returns list of detections with normalized bounding boxes.
      */
     @Synchronized
     fun detect(bitmap: Bitmap): List<Detection> {
@@ -380,7 +264,7 @@ class ObjectDetector(
         val inputShape = longArrayOf(1, 3, INPUT_SIZE.toLong(), INPUT_SIZE.toLong())
         val inputTensor = OnnxTensor.createTensor(ortEnv!!, FloatBuffer.wrap(chwBuffer), inputShape)
 
-        // Run model inference.
+        // Run inference
         val detections: List<Detection>
         var results: OrtSession.Result? = null
         try {
@@ -400,7 +284,7 @@ class ObjectDetector(
             results?.close()
         }
 
-        // Trim overlapping boxes.
+        // Remove duplicate bounding boxes
         val nmsDetections = nonMaxSuppression(detections)
 
         val elapsed = System.currentTimeMillis() - startTime
@@ -427,22 +311,22 @@ class ObjectDetector(
         rawOutput.rewind()
 
         return when {
-            // End-to-end layout: [1, N, 6/7] => xyxy + score + class.
+            // End-to-end layout: [1, N, 6/7] (xyxy + confidence + class)
             last in 6..7 && secondLast > 0 -> {
                 Log.d(TAG, "Parsing end-to-end layout (row-major): $outputShape")
                 parseEndToEndRowMajor(rawOutput, secondLast, last)
             }
-            // End-to-end transposed layout: [1, 6/7, N].
+            // End-to-end transposed layout: [1, 6/7, N]
             secondLast in 6..7 && last > 0 -> {
                 Log.d(TAG, "Parsing end-to-end layout (transposed): $outputShape")
                 parseEndToEndTransposed(rawOutput, secondLast, last)
             }
-            // Channel-first layout: [1, 4+N or 5+N, boxes].
+            // Channel-first layout: [1, 4+N or 5+N, boxes]
             secondLast == featureCountNoObjectness || secondLast == featureCountWithObjectness -> {
                 Log.d(TAG, "Parsing channel-first layout: $outputShape")
                 parseChannelFirst(rawOutput, secondLast, last)
             }
-            // Channel-last layout: [1, boxes, 4+N or 5+N].
+            // Channel-last layout: [1, boxes, 4+N or 5+N]
             last == featureCountNoObjectness || last == featureCountWithObjectness -> {
                 Log.d(TAG, "Parsing channel-last layout: $outputShape")
                 parseChannelLast(rawOutput, secondLast, last)
@@ -459,9 +343,9 @@ class ObjectDetector(
         channels: Int,
         numDetections: Int
     ): List<Detection> {
-        val expectedValueCount = channels * numDetections
-        if (expectedValueCount > rawOutput.limit()) {
-            Log.w(TAG, "Output buffer too small for channel-first layout: expected=$expectedValueCount actual=${rawOutput.limit()}")
+        val expectedValues = channels * numDetections
+        if (expectedValues > rawOutput.limit()) {
+            Log.w(TAG, "Output buffer too small for channel-first layout: expected=$expectedValues actual=${rawOutput.limit()}")
             return emptyList()
         }
 
@@ -471,7 +355,7 @@ class ObjectDetector(
         if (classCount <= 0) return emptyList()
 
         val detections = mutableListOf<Detection>()
-        val topScores = mutableListOf<CandidateScore>()
+        val topScores = mutableListOf<RawScore>()
 
         for (i in 0 until numDetections) {
             val objectness = if (hasObjectness) rawOutput.get(4 * numDetections + i) else 1f
@@ -515,9 +399,9 @@ class ObjectDetector(
         numDetections: Int,
         features: Int
     ): List<Detection> {
-        val expectedValueCount = numDetections * features
-        if (expectedValueCount > rawOutput.limit()) {
-            Log.w(TAG, "Output buffer too small for channel-last layout: expected=$expectedValueCount actual=${rawOutput.limit()}")
+        val expectedValues = numDetections * features
+        if (expectedValues > rawOutput.limit()) {
+            Log.w(TAG, "Output buffer too small for channel-last layout: expected=$expectedValues actual=${rawOutput.limit()}")
             return emptyList()
         }
 
@@ -527,16 +411,16 @@ class ObjectDetector(
         if (classCount <= 0) return emptyList()
 
         val detections = mutableListOf<Detection>()
-        val topScores = mutableListOf<CandidateScore>()
+        val topScores = mutableListOf<RawScore>()
 
         for (i in 0 until numDetections) {
-            val rowOffset = i * features
-            val objectness = if (hasObjectness) rawOutput.get(rowOffset + 4) else 1f
+            val base = i * features
+            val objectness = if (hasObjectness) rawOutput.get(base + 4) else 1f
 
             var bestScore = 0f
             var bestClassIdx = 0
             for (c in 0 until classCount) {
-                val classScore = rawOutput.get(rowOffset + classStart + c)
+                val classScore = rawOutput.get(base + classStart + c)
                 val combinedScore = objectness * classScore
                 if (combinedScore > bestScore) {
                     bestScore = combinedScore
@@ -552,10 +436,10 @@ class ObjectDetector(
                         label = classLabels[bestClassIdx],
                         confidence = bestScore,
                         boundingBox = xywhToNormalizedRect(
-                            rawOutput.get(rowOffset),
-                            rawOutput.get(rowOffset + 1),
-                            rawOutput.get(rowOffset + 2),
-                            rawOutput.get(rowOffset + 3)
+                            rawOutput.get(base),
+                            rawOutput.get(base + 1),
+                            rawOutput.get(base + 2),
+                            rawOutput.get(base + 3)
                         ),
                         classIndex = bestClassIdx
                     )
@@ -572,23 +456,23 @@ class ObjectDetector(
         numDetections: Int,
         features: Int
     ): List<Detection> {
-        val expectedValueCount = numDetections * features
-        if (expectedValueCount > rawOutput.limit()) {
-            Log.w(TAG, "Output buffer too small for end-to-end layout: expected=$expectedValueCount actual=${rawOutput.limit()}")
+        val expectedValues = numDetections * features
+        if (expectedValues > rawOutput.limit()) {
+            Log.w(TAG, "Output buffer too small for end-to-end layout: expected=$expectedValues actual=${rawOutput.limit()}")
             return emptyList()
         }
 
         val detections = mutableListOf<Detection>()
-        val topScores = mutableListOf<CandidateScore>()
+        val topScores = mutableListOf<RawScore>()
 
         for (i in 0 until numDetections) {
-            val rowOffset = i * features
+            val base = i * features
             val confidence = if (features >= 7) {
-                rawOutput.get(rowOffset + 4) * rawOutput.get(rowOffset + 5)
+                rawOutput.get(base + 4) * rawOutput.get(base + 5)
             } else {
-                rawOutput.get(rowOffset + 4)
+                rawOutput.get(base + 4)
             }
-            val classRaw = if (features >= 7) rawOutput.get(rowOffset + 6) else rawOutput.get(rowOffset + 5)
+            val classRaw = if (features >= 7) rawOutput.get(base + 6) else rawOutput.get(base + 5)
             val classIdx = classRaw.roundToInt()
             if (classIdx !in classLabels.indices) continue
 
@@ -600,10 +484,10 @@ class ObjectDetector(
                         label = classLabels[classIdx],
                         confidence = confidence,
                         boundingBox = xyxyToNormalizedRect(
-                            rawOutput.get(rowOffset),
-                            rawOutput.get(rowOffset + 1),
-                            rawOutput.get(rowOffset + 2),
-                            rawOutput.get(rowOffset + 3)
+                            rawOutput.get(base),
+                            rawOutput.get(base + 1),
+                            rawOutput.get(base + 2),
+                            rawOutput.get(base + 3)
                         ),
                         classIndex = classIdx
                     )
@@ -620,14 +504,14 @@ class ObjectDetector(
         features: Int,
         numDetections: Int
     ): List<Detection> {
-        val expectedValueCount = features * numDetections
-        if (expectedValueCount > rawOutput.limit()) {
-            Log.w(TAG, "Output buffer too small for transposed end-to-end layout: expected=$expectedValueCount actual=${rawOutput.limit()}")
+        val expectedValues = features * numDetections
+        if (expectedValues > rawOutput.limit()) {
+            Log.w(TAG, "Output buffer too small for transposed end-to-end layout: expected=$expectedValues actual=${rawOutput.limit()}")
             return emptyList()
         }
 
         val detections = mutableListOf<Detection>()
-        val topScores = mutableListOf<CandidateScore>()
+        val topScores = mutableListOf<RawScore>()
 
         for (i in 0 until numDetections) {
             val confidence = if (features >= 7) {
@@ -667,13 +551,13 @@ class ObjectDetector(
     }
 
     private fun updateTopScores(
-        topScores: MutableList<CandidateScore>,
+        topScores: MutableList<RawScore>,
         detectionIndex: Int,
         classIndex: Int,
         score: Float
     ) {
         if (topScores.size < TOP_SCORE_LOG_COUNT || score > topScores.last().score) {
-            topScores.add(CandidateScore(detectionIndex, classIndex, score))
+            topScores.add(RawScore(detectionIndex, classIndex, score))
             topScores.sortByDescending { it.score }
             if (topScores.size > TOP_SCORE_LOG_COUNT) {
                 topScores.removeAt(topScores.lastIndex)
@@ -681,13 +565,13 @@ class ObjectDetector(
         }
     }
 
-    private fun logTopScores(topScores: List<CandidateScore>) {
+    private fun logTopScores(topScores: List<RawScore>) {
         Log.d(TAG, "Top-$TOP_SCORE_LOG_COUNT raw scores (threshold=$CONFIDENCE_THRESHOLD):")
-        for (candidate in topScores) {
-            val label = classLabels.getOrElse(candidate.classIndex) { "class${candidate.classIndex}" }
+        for (score in topScores) {
+            val label = classLabels.getOrElse(score.classIdx) { "class${score.classIdx}" }
             Log.d(
                 TAG,
-                "  det[${candidate.detectionIndex}] $label = ${String.format(Locale.US, "%.4f", candidate.score)}"
+                "  det[${score.detIdx}] $label = ${String.format(Locale.US, "%.4f", score.score)}"
             )
         }
     }
@@ -698,12 +582,12 @@ class ObjectDetector(
         width: Float,
         height: Float
     ): RectF {
-        val looksNormalized = maxOf(abs(xCenter), abs(yCenter), abs(width), abs(height)) <= 2.5f
+        val alreadyNormalized = maxOf(abs(xCenter), abs(yCenter), abs(width), abs(height)) <= 2.5f
 
-        val left = if (looksNormalized) xCenter - width / 2f else (xCenter - width / 2f) / INPUT_SIZE
-        val top = if (looksNormalized) yCenter - height / 2f else (yCenter - height / 2f) / INPUT_SIZE
-        val right = if (looksNormalized) xCenter + width / 2f else (xCenter + width / 2f) / INPUT_SIZE
-        val bottom = if (looksNormalized) yCenter + height / 2f else (yCenter + height / 2f) / INPUT_SIZE
+        val left = if (alreadyNormalized) xCenter - width / 2f else (xCenter - width / 2f) / INPUT_SIZE
+        val top = if (alreadyNormalized) yCenter - height / 2f else (yCenter - height / 2f) / INPUT_SIZE
+        val right = if (alreadyNormalized) xCenter + width / 2f else (xCenter + width / 2f) / INPUT_SIZE
+        val bottom = if (alreadyNormalized) yCenter + height / 2f else (yCenter + height / 2f) / INPUT_SIZE
 
         return RectF(
             left.coerceIn(0f, 1f),
@@ -728,12 +612,12 @@ class ObjectDetector(
 
     private fun normalizeCoordinate(value: Float): Float {
         if (!value.isFinite()) return 0f
-        val normalizedValue = if (value > 1.5f || value < -0.5f) value / INPUT_SIZE else value
-        return normalizedValue.coerceIn(0f, 1f)
+        val normalized = if (value > 1.5f || value < -0.5f) value / INPUT_SIZE else value
+        return normalized.coerceIn(0f, 1f)
     }
 
     /**
-     * Standard NMS pass to drop overlapping detections.
+     * Non-maximum suppression to remove overlapping detections.
      */
     private fun nonMaxSuppression(detections: List<Detection>): List<Detection> {
         if (detections.isEmpty()) return emptyList()

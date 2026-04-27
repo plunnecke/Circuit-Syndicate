@@ -25,29 +25,30 @@ import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * BLE manager for the glasses side of the app.
+ * Manages BLE (GATT) connections to ESP32-class peripherals.
  *
- * What this file handles:
- * - Scan + connect to ESP32-style peripherals over GATT
- * - Request a larger MTU so JPEG chunks move faster
- * - Write commands and receive notification bytes
- * - Auto-reconnect after drops (5 second retry)
- * - Keep multiple sessions, with one active write target
+ * The glasses use BLE and are managed separately from the vest BLE session
+ * in DeviceManager. This class handles:
+ *   • BLE scan + GATT connection
+ *   • MTU negotiation (maximise throughput for JPEG chunks)
+ *   • GATT characteristic write (commands to ESP32-CAM)
+ *   • GATT notification subscribe + receive (binary chunk data from ESP32-CAM)
+ *   • Auto-reconnect on drop (5 s delay, same reconnect cadence as DeviceManager)
+ *   • Multiple simultaneous BLE sessions (one active write target + additional links)
  *
- * Camera command bytes used here:
- * - GlassesImagePipeline.CMD_SINGLE_PHOTO (0x01)
- * - GlassesImagePipeline.CMD_BURST (0x04)
- * - GlassesImagePipeline.CMD_BURST_CADENCE_HINT (0x05)
+ * Commands to ESP32-CAM:
+ *   GlassesImagePipeline.CMD_SINGLE_PHOTO (0x01)
+ *   GlassesImagePipeline.CMD_BURST        (0x04)
+ *   GlassesImagePipeline.CMD_BURST_CADENCE_HINT (0x05, optional)
  *
- * Incoming chunk data is forwarded to [GlassesImagePipeline.onBleData].
+ * Data from ESP32-CAM: binary chunks routed to [GlassesImagePipeline.onBleData].
  *
- * Connection state is broadcast using "BT_CONNECTION_CHANGED"
- * with device_type="GLASSES" and connected=Boolean.
+ * All connection state is broadcast to the app via:
+ *   "BT_CONNECTION_CHANGED" → device_type="GLASSES", connected=Boolean
  *
- * Matching strategy:
- * - Try known GATT profiles first.
- * - If none match, fall back to first writable characteristic
- *   plus first notify/indicate characteristic that exists.
+ * Known GATT profiles are tried first. If no known profile matches, this manager
+ * falls back to a generic heuristic: first writable characteristic + first
+ * notify/indicate characteristic discovered on the peripheral.
  */
 object GlassesBleManager {
 
@@ -84,7 +85,7 @@ object GlassesBleManager {
         var writeInProgress: Boolean = false
     )
 
-    // Profiles we have seen across firmware variants in this repo.
+    // Known profile set used by firmware variants in this repo lineage.
     private val KNOWN_PROFILES = listOf(
         KnownProfile(
             serviceUuid = UUID.fromString("4fafc201-1fb5-459e-8fcc-c5c9c331914b"),
@@ -105,7 +106,7 @@ object GlassesBleManager {
     private const val AUTO_CONNECT_MANUAL_DISCONNECT_COOLDOWN_MS = 15_000L
     private const val PREFS_NAME = "glasses_ble_state"
     private const val PREF_LAST_CONNECTED_ADDRESS = "last_connected_address"
-    private const val TARGET_MTU = 512  // ask for a bigger MTU so image chunks fit better
+    private const val TARGET_MTU = 512  // request large MTU for JPEG throughput
     private const val DEFAULT_MTU = 23
     private val AUTO_CONNECT_FIRMWARE_SERVICE_UUID =
         UUID.fromString("12345678-1234-5678-1234-56789abcdef0")
@@ -132,7 +133,7 @@ object GlassesBleManager {
     private val sessionLock = Any()
     private val sessionsByAddress = linkedMapOf<String, BleSession>()
 
-    // ── Setup ─────────────────────────────────────────────────────────────────
+    // ── Init ──────────────────────────────────────────────────────────────────
 
     fun initialize(context: Context) {
         appContext = context.applicationContext
@@ -145,7 +146,7 @@ object GlassesBleManager {
         bluetoothAdapter = btMgr.adapter
     }
 
-    // ── Public methods ────────────────────────────────────────────────────────
+    // ── Public API ────────────────────────────────────────────────────────────
 
     fun isConnected(): Boolean = isConnected.get()
 
@@ -183,16 +184,6 @@ object GlassesBleManager {
         return GlassesCaptureSettings.isCaptureEnabled(appContext)
     }
 
-    fun isCaptureActivelyStreaming(maxSilenceMs: Long = 15_000L): Boolean {
-        if (!::appContext.isInitialized || !::pipeline.isInitialized) return false
-        return isConnected() && isCaptureEnabled() && pipeline.isCaptureActivityRecent(maxSilenceMs)
-    }
-
-    fun isCapturePipelineBusy(): Boolean {
-        if (!::pipeline.isInitialized) return false
-        return pipeline.isCapturePipelineBusy()
-    }
-
     fun setCaptureEnabled(enabled: Boolean) {
         if (!::appContext.isInitialized) return
         val previous = GlassesCaptureSettings.isCaptureEnabled(appContext)
@@ -200,13 +191,6 @@ object GlassesBleManager {
         pipeline.setCaptureGateEnabled(enabled, source = "APP")
 
         if (previous != enabled) {
-            if (!enabled) {
-                synchronized(sessionLock) {
-                    sessionsByAddress.values.forEach { session ->
-                        clearWriteQueueLocked(session)
-                    }
-                }
-            }
             DeviceManager.vestHandler?.onCaptureGateChanged(
                 enabled = enabled,
                 source = "GLASSES_CAPTURE_TOGGLE"
@@ -215,7 +199,7 @@ object GlassesBleManager {
         }
     }
 
-    /** Connect using a MAC address (typically from the scan UI). */
+    /** Connect by MAC address (from BluetoothActivity scan). */
     fun connect(address: String) {
         InteractionLogger.logSessionEvidence("GLASSES_BLE", "CONNECT_REQUEST", "address=$address")
         synchronized(sessionLock) {
@@ -228,7 +212,7 @@ object GlassesBleManager {
         connectToAddress(address)
     }
 
-    /** Connect using a discovered BluetoothDevice instance. */
+    /** Connect directly to a discovered BLE device instance. */
     fun connect(device: BluetoothDevice) {
         val address = device.address ?: return
         InteractionLogger.logSessionEvidence("GLASSES_BLE", "CONNECT_REQUEST", "address=$address")
@@ -279,7 +263,7 @@ object GlassesBleManager {
         }
     }
 
-    /** Pause scan-triggered auto-connect after an explicit manual disconnect. */
+    /** Suppress scan-driven auto-connect after an explicit user disconnect action. */
     fun suppressAutoConnectForManualDisconnect(
         durationMs: Long = AUTO_CONNECT_MANUAL_DISCONNECT_COOLDOWN_MS
     ) {
@@ -314,136 +298,42 @@ object GlassesBleManager {
         return if (BluetoothAdapter.checkBluetoothAddress(stored)) stored else null
     }
 
-    private fun dispatchCaptureCommandWithTelemetry(
-        mode: String,
-        trigger: String,
-        command: Byte
-    ): Boolean {
-        val cycleStarted = pipeline.beginCaptureCycle(
-            mode = mode,
-            trigger = trigger,
-            allowSupersede = trigger == "INTERRUPT_RESTART"
-        )
-        if (!cycleStarted) {
-            Log.i(
-                TAG,
-                "Capture command blocked by active pipeline state (mode=$mode, trigger=$trigger)"
-            )
-            return false
-        }
-        val sent = writeCommand(command)
-        pipeline.markCaptureCommandDispatch(command = command, sent = sent)
-        return sent
-    }
-
-    /** Send CMD_SINGLE_PHOTO (one capture + one detection pass). */
+    /** Write CMD_SINGLE_PHOTO — request one photo + detection run. */
     fun takePhoto(): Boolean {
-        return takePhotoInternal(cycleTrigger = "DIRECT")
-    }
-
-    private fun takePhotoInternal(cycleTrigger: String): Boolean {
         if (!isCaptureEnabled()) {
             Log.i(TAG, "Capture gate blocked single-photo command")
             return false
         }
-        if (cycleTrigger != "INTERRUPT_RESTART" && pipeline.isCapturePipelineBusy()) {
-            Log.i(TAG, "Capture pipeline busy; blocking single-photo command")
-            InteractionLogger.log(
-                "COMMAND_BLOCKED",
-                "APP→GLASSES",
-                "CMD_SINGLE_PHOTO blocked by active pipeline"
-            )
-            return false
-        }
-        queueCaptureEnableBeforeCaptureCommand()
         pipeline.prepareSinglePhoto()
-        return dispatchCaptureCommandWithTelemetry(
-            mode = "SINGLE",
-            trigger = cycleTrigger,
-            command = GlassesImagePipeline.CMD_SINGLE_PHOTO
-        )
+        return writeCommand(GlassesImagePipeline.CMD_SINGLE_PHOTO)
     }
 
-    /**
-     * Hard-restart in-flight capture work, then queue a fresh single-photo request.
-     * This clears queued writes and invalidates active pipeline reassembly before
-     * issuing CMD_CAPTURE_STOP followed by CMD_SINGLE_PHOTO.
-     */
-    fun interruptAndTakePhoto(): Boolean {
-        if (!isCaptureEnabled()) {
-            Log.i(TAG, "Capture gate blocked single-photo restart command")
-            return false
-        }
-
-        pipeline.abortInFlightCapture(reason = "SINGLE_RESTART")
-        synchronized(sessionLock) {
-            sessionsByAddress.values.forEach { session ->
-                clearWriteQueueLocked(session)
-            }
-        }
-
-        val stopQueued = writePayload(byteArrayOf(GlassesImagePipeline.CMD_CAPTURE_STOP))
-        InteractionLogger.logCommand("CMD_CAPTURE_STOP", "APP→GLASSES")
-        if (!stopQueued) {
-            Log.w(TAG, "Single-photo restart requested but capture stop command was not queued")
-        }
-
-        return takePhotoInternal(cycleTrigger = "INTERRUPT_RESTART")
-    }
-
-    /** Send CMD_BURST (burst capture + detection run). */
+    /** Write CMD_BURST — request burst capture + detection run. */
     fun takeBurst(): Boolean {
-        return takeBurstInternal(
+        return takeBurst(
             recommendedInterFrameDelayMs = null,
-            cadenceHealth = null,
-            cycleTrigger = "DIRECT"
+            cadenceHealth = null
         )
     }
 
     /**
-     * Send CMD_BURST and optionally append a cadence hint payload.
+     * Write CMD_BURST and optionally append a cadence hint payload.
      *
-     * Compatibility notes:
-     * - Base burst command always goes out first.
-     * - Cadence hint is best-effort and optional for firmware.
-     * - If hint enqueue fails, the queued burst command is still valid.
+     * Compatibility contract:
+     * - The base burst command is always sent first.
+     * - Cadence hint is best-effort and optional for firmware to consume.
+     * - Failure to enqueue the hint never cancels a queued burst command.
      */
     fun takeBurst(
         recommendedInterFrameDelayMs: Long?,
         cadenceHealth: GlassesImagePipeline.BurstCadenceHealth?
     ): Boolean {
-        return takeBurstInternal(
-            recommendedInterFrameDelayMs = recommendedInterFrameDelayMs,
-            cadenceHealth = cadenceHealth,
-            cycleTrigger = "DIRECT"
-        )
-    }
-
-    private fun takeBurstInternal(
-        recommendedInterFrameDelayMs: Long?,
-        cadenceHealth: GlassesImagePipeline.BurstCadenceHealth?,
-        cycleTrigger: String
-    ): Boolean {
         if (!isCaptureEnabled()) {
             Log.i(TAG, "Capture gate blocked burst command")
             return false
         }
-        if (cycleTrigger != "INTERRUPT_RESTART" && pipeline.isCapturePipelineBusy()) {
-            Log.i(TAG, "Capture pipeline busy; blocking burst command")
-            InteractionLogger.log(
-                "COMMAND_BLOCKED",
-                "APP→GLASSES",
-                "CMD_BURST blocked by active pipeline"
-            )
-            return false
-        }
-        queueCaptureEnableBeforeCaptureCommand()
         pipeline.prepareBurst()
-        val burstQueued = dispatchCaptureCommandWithTelemetry(
-            mode = "BURST",
-            trigger = cycleTrigger,
-            command = GlassesImagePipeline.CMD_BURST
-        )
+        val burstQueued = writeCommand(GlassesImagePipeline.CMD_BURST)
         if (!burstQueued) return false
 
         val cadenceHintPayload = buildBurstCadenceHintPayload(
@@ -464,18 +354,9 @@ object GlassesBleManager {
         return true
     }
 
-    private fun queueCaptureEnableBeforeCaptureCommand() {
-        val enableQueued = writeCommand(GlassesImagePipeline.CMD_CAPTURE_ENABLE)
-        if (!enableQueued) {
-            Log.w(TAG, "Failed to queue pre-capture CMD_CAPTURE_ENABLE")
-            return
-        }
-        InteractionLogger.logCommand("CMD_CAPTURE_ENABLE", "APP→GLASSES")
-    }
-
     /**
-     * Hard-restart in-flight capture work, then queue a fresh burst request.
-     * This clears queued writes and invalidates active pipeline reassembly before
+     * Force-stop in-flight capture/transmission work and queue a fresh burst request.
+     * This drops queued writes and invalidates active pipeline reassembly before
      * issuing CMD_CAPTURE_STOP followed by CMD_BURST.
      */
     fun interruptAndTakeBurst(
@@ -500,14 +381,13 @@ object GlassesBleManager {
             Log.w(TAG, "Burst restart requested but capture stop command was not queued")
         }
 
-        return takeBurstInternal(
+        return takeBurst(
             recommendedInterFrameDelayMs = recommendedInterFrameDelayMs,
-            cadenceHealth = cadenceHealth,
-            cycleTrigger = "INTERRUPT_RESTART"
+            cadenceHealth = cadenceHealth
         )
     }
 
-    /** Write raw payload bytes to the active command characteristic. */
+    /** Write an arbitrary payload to the command characteristic. */
     fun writePayload(payload: ByteArray): Boolean {
         if (payload.isEmpty()) return false
 
@@ -553,7 +433,7 @@ object GlassesBleManager {
         }
     }
 
-    /** Expose pipeline so UI code can check inference/capture readiness. */
+    /** Expose pipeline so StatusActivity can show inference readiness. */
     fun getPipeline(): GlassesImagePipeline = pipeline
 
     fun stopSpeech() {
@@ -562,7 +442,7 @@ object GlassesBleManager {
         }
     }
 
-    // ── Scan flow ─────────────────────────────────────────────────────────────
+    // ── BLE scan ──────────────────────────────────────────────────────────────
 
     fun startScan(onFound: (BluetoothDevice, String) -> Unit) {
         if (!hasPermission(Manifest.permission.BLUETOOTH_SCAN)) return
@@ -676,7 +556,7 @@ object GlassesBleManager {
         return true
     }
 
-    // ── GATT connection flow ──────────────────────────────────────────────────
+    // ── GATT connection ───────────────────────────────────────────────────────
 
     private fun connectToAddress(address: String) {
         if (!hasPermission(Manifest.permission.BLUETOOTH_CONNECT)) return
@@ -939,7 +819,7 @@ object GlassesBleManager {
             }
         }
 
-        // API 33+ callback signature
+        // API 33+ override
         override fun onCharacteristicChanged(
             g: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
@@ -1003,7 +883,7 @@ object GlassesBleManager {
         }
     }
 
-    // ── Command writes ────────────────────────────────────────────────────────
+    // ── Command write ─────────────────────────────────────────────────────────
 
     private fun writeCommand(cmd: Byte): Boolean = writePayload(byteArrayOf(cmd))
 
@@ -1044,7 +924,7 @@ object GlassesBleManager {
             GlassesImagePipeline.BurstCadenceHealth.DEGRADED -> BURST_CADENCE_HEALTH_DEGRADED
         }
 
-        // Byte layout: [cmd, version, delayMs_lo, delayMs_hi, healthCode]
+        // Payload format: [cmd, version, delayMs_lo, delayMs_hi, healthCode]
         return byteArrayOf(
             GlassesImagePipeline.CMD_BURST_CADENCE_HINT,
             BURST_CADENCE_HINT_VERSION,
@@ -1141,7 +1021,7 @@ object GlassesBleManager {
         session.writeInProgress = false
     }
 
-    // ── Reconnect flow ────────────────────────────────────────────────────────
+    // ── Reconnect ─────────────────────────────────────────────────────────────
 
     private fun scheduleReconnect(address: String) {
         InteractionLogger.logSessionEvidence(
@@ -1169,7 +1049,7 @@ object GlassesBleManager {
         }, RECONNECT_DELAY_MS)
     }
 
-    // ── Shutdown / cleanup ────────────────────────────────────────────────────
+    // ── Cleanup ───────────────────────────────────────────────────────────────
 
     private fun closeGattLocked(session: BleSession) {
         val g = session.gatt
@@ -1440,7 +1320,7 @@ object GlassesBleManager {
         })
     }
 
-    // ── Permission check helper ───────────────────────────────────────────────
+    // ── Permission helper ─────────────────────────────────────────────────────
 
     private fun hasPermission(permission: String) =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)

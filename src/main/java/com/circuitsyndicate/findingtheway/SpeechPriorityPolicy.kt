@@ -35,6 +35,10 @@ object SpeechPriorityPolicy {
         }
 
         val roundedFeet = distanceFeet.toInt().coerceAtLeast(1)
-        return "about $roundedFeet feet away"
+        return if (isUrgentDistance(distanceFeet)) {
+            "within 5 feet, about $roundedFeet feet away"
+        } else {
+            "about $roundedFeet feet away"
+        }
     }
 }

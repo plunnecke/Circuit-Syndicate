@@ -5,51 +5,51 @@ import android.util.Log
 import java.util.Locale
 
 /**
- * Quick distance estimate for detected objects using:
+ * Estimates approximate distance to detected objects using
  *
  * distance = (bounding_box_height_pixels * focal_length) / approx_real_height
  *
- * Not perfect, but solid enough for real-time guidance.
  */
 class DistanceEstimator {
 
     companion object {
         private const val TAG = "DistanceEstimator"
 
-        // Focal-length calibration cheat sheet for OV2640 at VGA (640x480).
-        // Close range gets more lens distortion, so effective focal length trends lower.
+        // Calibrated focal lengths at multiple distances for OV2640 at VGA (640×480).
+        // Close-range bboxes experience more barrel distortion → lower effective focal length.
         //
         // Calibration points (person, 1.7 m real height):
-        //   2 ft (0.61 m): bboxH ~= 920 px, f = (920 * 0.61) / 1.7 ~= 330
-        //   3 ft (0.91 m): bboxH ~= 710 px, f = (710 * 0.91) / 1.7 ~= 380
-        //   4 ft (1.22 m): bboxH ~= 564 px, f = (564 * 1.22) / 1.7 ~= 405
-        //   6 ft (1.83 m): bboxH ~= 403 px, f = (403 * 1.83) / 1.7 ~= 434
-        //   9 ft (2.74 m): bboxH ~= 279 px, f = (279 * 2.74) / 1.7 ~= 450
-        //  15 ft (4.57 m): bboxH ~= 175 px, f = (175 * 4.57) / 1.7 ~= 470
-        //  20 ft (6.10 m): bboxH ~= 133 px, f = (133 * 6.10) / 1.7 ~= 477
-        //  25 ft (7.62 m): bboxH ~= 108 px, f = (108 * 7.62) / 1.7 ~= 484
+        //   2 ft (0.61 m): bboxH ≈ 920 px, f = (920 * 0.61) / 1.7 ≈ 330
+        //   3 ft (0.91 m): bboxH ≈ 710 px, f = (710 * 0.91) / 1.7 ≈ 380
+        //   4 ft (1.22 m): bboxH ≈ 564 px, f = (564 * 1.22) / 1.7 ≈ 405
+        //   6 ft (1.83 m): bboxH ≈ 403 px, f = (403 * 1.83) / 1.7 ≈ 434
+        //   9 ft (2.74 m): bboxH ≈ 279 px, f = (279 * 2.74) / 1.7 ≈ 450
+        //  15 ft (4.57 m): bboxH ≈ 175 px, f = (175 * 4.57) / 1.7 ≈ 470
+        //  20 ft (6.10 m): bboxH ≈ 133 px, f = (133 * 6.10) / 1.7 ≈ 477
+        //  25 ft (7.62 m): bboxH ≈ 108 px, f = (108 * 7.62) / 1.7 ≈ 484
         //
-        // We linearly interpolate between anchors using measured bbox height,
-        // so focal length adapts by range instead of being one fixed number.
+        // We linearly interpolate between these anchor points based on the
+        // measured bboxH to get a range-adaptive focal length.
         private val FOCAL_ANCHORS = floatArrayOf(920f, 710f, 564f, 403f, 279f, 175f, 133f, 108f)  // bboxH (px)
         private val FOCAL_VALUES  = floatArrayOf(330f, 380f, 405f, 434f, 450f, 470f, 477f, 484f)  // effective f
-        const val DEFAULT_FOCAL_LENGTH_PX = 434f   // fallback for mid range
+        const val DEFAULT_FOCAL_LENGTH_PX = 434f   // mid-range fallback
 
-        // Default frame dimensions (VGA). We override these at runtime
-        // once we know the actual decoded bitmap size.
+        // Default frame dimensions (VGA).  Overridden at runtime when actual
+        // decoded bitmap dimensions are available.
         const val DEFAULT_FRAME_WIDTH  = 640f
         const val DEFAULT_FRAME_HEIGHT = 480f
 
         // EMA smoothing factor for distance readings (0-1).
-        // Lower value = smoother but laggier. 0.35 settles in about 3 reads.
+        // Lower = smoother / more lag.  0.35 gives ~3-reading settling.
         private const val DISTANCE_EMA_ALPHA = 0.35f
 
-        // If a smoothing entry sits longer than this, reset it.
+        // Maximum age (ms) before a smoothing entry is considered stale
+        // and the EMA is reset.
         private const val SMOOTHING_STALE_MS = 10_000L
     }
 
-    // Approx real-world heights (meters) for common Open Images labels.
-    // null/missing means we do not trust height-based math for that label.
+    // Known approximate real-world heights in meters for Open Images classes.
+    // null / absent = unknown/unreliable → area-based fallback.
     private enum class LabelMappingKind {
         DIRECT,
         ALIAS,
@@ -172,8 +172,9 @@ class DistanceEstimator {
     )
 
     // Expected full-body aspect ratio (width / height) for classes where
-    // partial views happen a lot. If detected bbox is way wider than expected,
-    // we assume part of the object is missing and scale assumed height down.
+    // partial visibility is common.  When the detected bbox is significantly
+    // wider (higher aspect ratio) than expected, we assume only a portion of
+    // the object is visible and scale the assumed height down accordingly.
     private val expectedAspectRatios: Map<String, Float> = mapOf(
         "person" to 0.42f,   // standing full-body at VGA
         "car" to 1.6f,
@@ -195,24 +196,24 @@ class DistanceEstimator {
     var calibratedFocalLengthPx: Float? = null
     var useCalibratedIntrinsics: Boolean = false
 
-    // Actual frame dimensions from decoded bitmap.
-    // This prevents silent breakage if firmware resolution ever changes.
+    // Actual frame dimensions – set once from the decoded bitmap so the
+    // estimator is not silently broken if the firmware resolution changes.
     var frameWidth:  Float = DEFAULT_FRAME_WIDTH
     var frameHeight: Float = DEFAULT_FRAME_HEIGHT
 
-    // EMA smoothing state keyed by trackId (or label fallback).
+    // ---- EMA smoothing state keyed by trackId (or label fallback) ----
     private data class SmoothEntry(var emaFeet: Float, var lastUpdateMs: Long)
     private val smoothed = mutableMapOf<String, SmoothEntry>()
 
     /**
-     * Estimate distance to one detection.
-     * Result is EMA-smoothed across consecutive calls for the same track,
-     * which helps cut down frame-to-frame jitter.
+     * Estimate distance to a detected object.
+     * The returned distance is EMA-smoothed across consecutive calls
+     * for the same tracked instance, eliminating frame-to-frame jitter.
      *
-     * @param label Object class label
+     * @param label The object class label
      * @param boundingBox Normalized bounding box (0-1)
-     * @param trackId Per-instance ID from MotionTracker (-1 means untracked, so we fall back to label key)
-     * @return DistanceResult with estimated distance/category/confidence
+     * @param trackId Unique per-instance track ID from MotionTracker (-1 = untracked, falls back to label key)
+     * @return DistanceResult with estimated distance and category
      */
     fun estimateDistance(label: String, boundingBox: RectF, trackId: Int = -1): DistanceResult {
         val bboxWidth  = boundingBox.right - boundingBox.left
@@ -220,7 +221,7 @@ class DistanceEstimator {
         val bboxHeightPx = bboxHeight * frameHeight
         val bboxArea = bboxWidth * bboxHeight
         val bboxAspect = if (bboxHeight > 0.001f) bboxWidth / bboxHeight else 0f
-        // Use trackId for per-instance smoothing; otherwise fall back to label.
+        // Smoothing key: use trackId for per-instance EMA; fall back to label when untracked.
         val mapping = resolveLabelMapping(label)
         val canonicalLabel = mapping.canonicalLabel
         val smoothKey = if (trackId >= 0) "track:$trackId" else "label:$canonicalLabel"
@@ -232,14 +233,15 @@ class DistanceEstimator {
         val knownHeight = mapping.knownHeightMeters
 
         return if (knownHeight != null && bboxHeightPx > 5f) {
-            // Partial-body correction:
-            // if bbox is much wider than expected full-body shape, it is
-            // probably a partial view (seated/occluded), so lower height input
-            // to avoid overestimating distance.
+            // --- Partial-body correction ---
+            // If the detection's aspect ratio is significantly wider than the
+            // expected full-body ratio, the object is likely only partially
+            // visible (e.g. seated / occluded).  Scale assumed height down so
+            // the distance formula doesn't over-estimate.
             val effectiveHeight = adjustForPartialVisibility(canonicalLabel, knownHeight, bboxAspect)
 
-            // Prefer calibrated intrinsics if available.
-            // Otherwise keep the range-adaptive focal interpolation path.
+            // Use calibrated intrinsics when available; otherwise keep
+            // existing range-adaptive focal interpolation behavior.
             val effectiveFocal = if (useCalibratedIntrinsics && calibratedFocalLengthPx != null) {
                 calibratedFocalLengthPx!!.coerceAtLeast(1f)
             } else {
@@ -251,12 +253,12 @@ class DistanceEstimator {
 
             val confidence = when {
                 mapping.kind == LabelMappingKind.INFERRED -> if (bboxHeightPx > 30f) "medium" else "low"
-                effectiveHeight < knownHeight * 0.95f -> "medium"  // partial body lowers confidence
+                effectiveHeight < knownHeight * 0.95f -> "medium"  // partial-body → lower confidence
                 bboxHeightPx > 30f -> "high"
                 else -> "medium"
             }
 
-            // Apply per-track EMA smoothing
+            // Apply EMA smoothing per tracked instance
             val smoothedFeet = smoothDistance(smoothKey, distanceFeet)
 
             DistanceResult(
@@ -265,16 +267,16 @@ class DistanceEstimator {
                 confidenceLevel = confidence
             )
         } else {
-            // Fall back to area-based estimation with inverse-square behavior.
+            // Fall back to area-based estimation using inverse-square model.
             // bbox area ~= (realSize * f / d)^2 / (frameW * frameH)
-            // Calibrated roughly as: area 0.15 ~= 3 ft, area 0.01 ~= 18 ft.
-            // Model: d ~= k / sqrt(area), where k comes from anchor data.
+            // We calibrate: area 0.15 ≈ 3 ft, area 0.01 ≈ 18 ft.
+            // Model: d ≈ k / sqrt(area), k calibrated from anchor.
             val areaFeet = if (bboxArea > 0.0001f) {
-                // k = 3 * sqrt(0.15) = 1.16, from 3 ft at area 0.15
+                // k = 3 * sqrt(0.15) = 1.16  (calibrated from 3 ft at area 0.15)
                 val k = 1.16f
                 (k / kotlin.math.sqrt(bboxArea)).coerceIn(1f, 100f)
             } else {
-                100f  // tiny box means very far
+                100f  // vanishingly small box → very far
             }
 
             val smoothedFeet = smoothDistance(smoothKey, areaFeet)
@@ -288,9 +290,9 @@ class DistanceEstimator {
     }
 
     /**
-     * If detected bbox is much wider than expected full-body ratio,
-     * scale assumed real-world height proportionally.
-     * Clamp to 40%-100% of known height.
+     * If the bbox aspect ratio is significantly wider than the expected
+     * full-body ratio for this class, scale the assumed real-world height
+     * proportionally.  Clamped to [40%..100%] of the known height.
      */
     private fun adjustForPartialVisibility(
         canonicalLabel: String,
@@ -298,10 +300,10 @@ class DistanceEstimator {
         detectedAspect: Float
     ): Float {
         val expectedAR = expectedAspectRatios[canonicalLabel] ?: return fullHeight
-        if (detectedAspect <= expectedAR * 1.3f) return fullHeight   // within 30% => treat as full body
+        if (detectedAspect <= expectedAR * 1.3f) return fullHeight   // within 30% → full body
 
-        // expected/detected aspect gives a rough visible-height fraction.
-        // Example: expected 0.42, detected 0.84 => about half height visible.
+        // Ratio of expected / detected aspect gives visibility fraction.
+        // e.g. expected 0.42, detected 0.84 → ~50% of height visible.
         val visibilityFraction = (expectedAR / detectedAspect).coerceIn(0.4f, 1.0f)
         val adjusted = fullHeight * visibilityFraction
         Log.d(TAG, "Partial-body correction for $canonicalLabel: aspect=$detectedAspect expected=$expectedAR → height ${fullHeight}→${adjusted}m")
@@ -357,34 +359,34 @@ class DistanceEstimator {
     }
 
     /**
-     * Piecewise-linear focal interpolation from bbox height.
-     * Uses [FOCAL_ANCHORS] and [FOCAL_VALUES].
-     * Anchors are ordered large bboxH (close) to small bboxH (far).
+     * Piecewise-linear interpolation of focal length based on bbox height.
+     * Uses the [FOCAL_ANCHORS] / [FOCAL_VALUES] calibration table.
+     * Anchors are ordered from large bboxH (close) to small bboxH (far).
      */
     private fun interpolateFocalLength(bboxHeightPx: Float): Float {
-        // Scale anchors to current frame height (table was calibrated at 480).
+        // Scale anchors to current frame height (anchors calibrated at 480).
         val scale = frameHeight / DEFAULT_FRAME_HEIGHT
         val anchors = FOCAL_ANCHORS.map { it * scale }
 
-        // bboxH larger than closest anchor => clamp to closest focal
+        // bboxH larger than closest anchor → clamp to closest focal
         if (bboxHeightPx >= anchors[0]) return FOCAL_VALUES[0]
-        // bboxH smaller than farthest anchor => clamp to farthest focal
+        // bboxH smaller than farthest anchor → clamp to farthest focal
         if (bboxHeightPx <= anchors.last()) return FOCAL_VALUES.last()
 
-        // Find the anchor segment and interpolate inside it.
+        // Find segment and interpolate
         for (i in 0 until anchors.size - 1) {
             if (bboxHeightPx <= anchors[i] && bboxHeightPx >= anchors[i + 1]) {
                 val t = (anchors[i] - bboxHeightPx) / (anchors[i] - anchors[i + 1])
                 return FOCAL_VALUES[i] + t * (FOCAL_VALUES[i + 1] - FOCAL_VALUES[i])
             }
         }
-        return focalLengthPx  // should not happen, but keep safe fallback
+        return focalLengthPx  // shouldn't reach here
     }
 
     /**
      * Exponential moving average for distance readings.
-     * Keyed by [smoothKey], which is either track ID or label fallback.
-     * Resets when entry gets stale (> [SMOOTHING_STALE_MS]).
+     * Keyed by [smoothKey] which encodes either a track ID or a label fallback.
+     * Resets if the entry is stale (> [SMOOTHING_STALE_MS]).
      */
     private fun smoothDistance(smoothKey: String, rawFeet: Float): Float {
         val now = System.currentTimeMillis()

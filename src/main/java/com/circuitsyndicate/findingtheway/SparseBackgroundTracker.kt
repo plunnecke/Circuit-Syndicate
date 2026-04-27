@@ -17,18 +17,8 @@ import org.opencv.imgproc.Imgproc
 import org.opencv.video.Video
 import kotlin.math.max
 
-/**
- * Sparse background tracker for rough camera ego-motion.
- *
- * Basic flow here:
- * 1) convert frames to gray,
- * 2) mask out detected objects,
- * 3) track background corners with LK optical flow,
- * 4) use medians so noisy tracks do not dominate.
- */
 object SparseBackgroundTracker {
 
-    // Tuning constants.
     private const val TAG = "SparseBgTracker"
     private const val MAX_CORNERS = 250
     private const val QUALITY_LEVEL = 0.01
@@ -39,16 +29,6 @@ object SparseBackgroundTracker {
 
     private val WIN_SIZE = Size(21.0, 21.0)
     private val TERM_CRITERIA = TermCriteria(TermCriteria.COUNT or TermCriteria.EPS, 20, 0.03)
-    private val nativeAvailabilityLock = Any()
-
-    @Volatile
-    private var nativeAvailabilityChecked = false
-
-    @Volatile
-    private var nativeAvailable = true
-
-    @Volatile
-    private var nativeDisableReason: String? = null
 
     data class Estimate(
         val velocity: PointF,
@@ -57,82 +37,17 @@ object SparseBackgroundTracker {
         val totalValidTracks: Int
     )
 
-    fun isNativeAvailable(): Boolean = ensureNativeAvailability()
-
-    private fun ensureNativeAvailability(): Boolean {
-        if (nativeAvailabilityChecked) {
-            return nativeAvailable
-        }
-
-        synchronized(nativeAvailabilityLock) {
-            if (nativeAvailabilityChecked) {
-                return nativeAvailable
-            }
-
-            nativeAvailable = runCatching {
-                // Quick JNI check once; if this fails, keep sparse tracking off for this process.
-                val probe = Mat()
-                probe.create(1, 1, CvType.CV_8UC1)
-                probe.release()
-            }.map { true }.getOrElse { error ->
-                nativeDisableReason = "init:${error.javaClass.simpleName}"
-                Log.w(
-                    TAG,
-                    "Sparse ego-motion disabled for process (Option B): ${error.message}"
-                )
-                false
-            }
-
-            nativeAvailabilityChecked = true
-            return nativeAvailable
-        }
-    }
-
-    private fun isNativeLinkageFailure(error: Throwable): Boolean {
-        var current: Throwable? = error
-        while (current != null) {
-            if (current is UnsatisfiedLinkError ||
-                current is NoClassDefFoundError ||
-                current is ExceptionInInitializerError
-            ) {
-                return true
-            }
-            current = current.cause
-        }
-        return false
-    }
-
-    private fun disableForProcess(reason: String, error: Throwable? = null) {
-        synchronized(nativeAvailabilityLock) {
-            if (nativeAvailabilityChecked && !nativeAvailable) {
-                return
-            }
-
-            nativeAvailabilityChecked = true
-            nativeAvailable = false
-            nativeDisableReason = reason
-        }
-
-        val details = error?.message?.takeIf { it.isNotBlank() } ?: "no-details"
-        Log.w(TAG, "Sparse ego-motion disabled for process (Option B): $reason ($details)")
-    }
-
     fun estimateCameraVelocity(
         bitmaps: List<Bitmap>,
         frameDetections: List<List<ObjectDetector.Detection>>,
         frameTimestamps: List<Long>
     ): Estimate? {
-        if (!ensureNativeAvailability()) {
-            return null
-        }
-
         if (bitmaps.size < 2) return null
 
         val pairVelocities = mutableListOf<PointF>()
         val pairConfidences = mutableListOf<Float>()
         var totalValidTracks = 0
 
-        // Process each consecutive frame pair.
         for (i in 1 until bitmaps.size) {
             val dtMs = frameTimestamps.getOrElse(i) { frameTimestamps.lastOrNull() ?: 0L } -
                     frameTimestamps.getOrElse(i - 1) { frameTimestamps.firstOrNull() ?: 0L }
@@ -195,11 +110,7 @@ object SparseBackgroundTracker {
                     val dx = ((currArray[idx].x - prevArray[idx].x) / w).toFloat()
                     val dy = ((currArray[idx].y - prevArray[idx].y) / h).toFloat()
 
-                    // Drop extreme jumps; they are usually bad tracks or bad correspondences.
-                    if (
-                        kotlin.math.abs(dx) > MAX_POINT_SHIFT_NORM ||
-                        kotlin.math.abs(dy) > MAX_POINT_SHIFT_NORM
-                    ) {
+                    if (kotlin.math.abs(dx) > MAX_POINT_SHIFT_NORM || kotlin.math.abs(dy) > MAX_POINT_SHIFT_NORM) {
                         continue
                     }
 
@@ -207,7 +118,6 @@ object SparseBackgroundTracker {
                     validDy.add(dy)
                 }
 
-                // Need enough stable tracks to trust this pair.
                 if (validDx.size < MIN_VALID_TRACKS) continue
 
                 totalValidTracks += validDx.size
@@ -218,10 +128,6 @@ object SparseBackgroundTracker {
                 val pairConfidence = (validDx.size.toFloat() / featurePoints.size.toFloat()).coerceIn(0f, 1f)
                 pairConfidences.add(pairConfidence)
             } catch (t: Throwable) {
-                if (isNativeLinkageFailure(t)) {
-                    disableForProcess("runtime:${t.javaClass.simpleName}", t)
-                    return null
-                }
                 Log.w(TAG, "Pair $i sparse tracking failed: ${t.message}")
             } finally {
                 prevGray.release()
@@ -237,7 +143,6 @@ object SparseBackgroundTracker {
 
         if (pairVelocities.isEmpty()) return null
 
-        // Aggregate pair estimates with medians to stay robust to outliers.
         val vx = median(pairVelocities.map { it.x })
         val vy = median(pairVelocities.map { it.y })
 
@@ -274,7 +179,6 @@ object SparseBackgroundTracker {
         detections: List<ObjectDetector.Detection>,
         outMask: Mat
     ) {
-        // White = allowed background area, black = masked-out detection regions.
         outMask.create(rows, cols, CvType.CV_8UC1)
         outMask.setTo(Scalar(255.0))
 

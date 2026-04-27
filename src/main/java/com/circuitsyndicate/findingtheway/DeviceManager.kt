@@ -256,12 +256,12 @@ object DeviceManager {
         if (normalized == CMD_TURN_ALL_OFF || normalized == CMD_TURN_SYSTEM_OFF) {
             vestSystemEnabled.set(false)
         }
-        if (normalized == CMD_TURN_ALL_ON || normalized == CMD_TURN_SYSTEM_ON) {
+        if (normalized == CMD_TURN_SYSTEM_ON || normalized == CMD_TURN_ALL_ON) {
             vestSystemEnabled.set(true)
         }
 
-        val sent = sendToVestBle(conn, normalized)
-        if (sent) InteractionLogger.logCommand(normalized, "APP→VEST")
+        val sent = sendToVestBle(conn, payload)
+        if (sent) InteractionLogger.logCommand(payload, "APP→VEST")
         return sent
     }
 
@@ -565,11 +565,7 @@ object DeviceManager {
 
         if (!started) {
             Log.e(TAG, "Vest BLE write could not be started")
-            InteractionLogger.logSessionEvidence(
-                "VEST_BLE",
-                "WRITE_START_FAILED",
-                "message=$message"
-            )
+            handleVestDisconnection(conn, reason = "write_start_failed")
             return false
         }
         return true

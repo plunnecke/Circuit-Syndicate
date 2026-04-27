@@ -12,29 +12,25 @@ class ObjectHistoryAdapter(
 ) : RecyclerView.Adapter<ObjectHistoryAdapter.ViewHolder>() {
 
     class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
-        val detectionTextView: TextView = view.findViewById(R.id.detection_text)
+        val text: TextView = view.findViewById(R.id.detection_text)
     }
 
-    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
-        val inflater = LayoutInflater.from(parent.context)
-        val rowView = inflater.inflate(R.layout.item_history, parent, false)
-        return ViewHolder(rowView)
-    }
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int) =
+        ViewHolder(LayoutInflater.from(parent.context)
+            .inflate(R.layout.item_history, parent, false))
 
     override fun onBindViewHolder(holder: ViewHolder, position: Int) {
-        val currentDetection = items[position]
-        holder.detectionTextView.text = currentDetection
-        holder.detectionTextView.contentDescription = "Detection: $currentDetection"
-        holder.itemView.setOnClickListener { onItemClick(currentDetection) }
+        val item = items[position]
+        holder.text.text = item
+        holder.text.contentDescription = "Detection: $item"
+        holder.itemView.setOnClickListener { onItemClick(item) }
     }
 
-    override fun getItemCount(): Int {
-        return items.size
-    }
+    override fun getItemCount() = items.size
 
-    fun updateData(updatedItems: MutableList<String>) {
+    fun updateData(newItems: MutableList<String>) {
         items.clear()
-        items.addAll(updatedItems)
+        items.addAll(newItems)
         notifyDataSetChanged()
     }
 }

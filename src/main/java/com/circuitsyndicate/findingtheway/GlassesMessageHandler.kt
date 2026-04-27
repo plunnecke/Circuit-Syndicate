@@ -4,22 +4,19 @@ import android.content.Context
 import android.util.Log
 
 /**
- * Basically a small glue class between GlassesBleManager and the rest of the app.
+ * Thin adapter between GlassesBleManager and the rest of the app.
  *
- * The glasses connect over BLE now (through GlassesBleManager).
- * Image chunk handling, reassembly, and inference all happen in GlassesImagePipeline.
- * This class mostly keeps DeviceManager's interface stable and pushes state updates
- * out to listeners.
+ * The glasses now connect via BLE (GlassesBleManager) rather than SPP.
+ * All image reassembly and inference runs inside GlassesImagePipeline.
+ * This class exists purely to give DeviceManager a consistent interface
+ * and to expose connection state to listeners.
  *
- * Reminder:
- * - GlassesBleManager.initialize() is called from FindingTheWayApp.
- * - Commands still go through GlassesCommandSender -> GlassesBleManager.
+ * Note: GlassesBleManager.initialize() is called from FindingTheWayApp.
+ * Commands go through GlassesCommandSender → GlassesBleManager.
  */
 class GlassesMessageHandler(private val context: Context) {
 
-    companion object {
-        private const val TAG = "GlassesHandler"
-    }
+    companion object { private const val TAG = "GlassesHandler" }
 
     data class GlassesState(
         var connected: Boolean = false,
@@ -44,7 +41,7 @@ class GlassesMessageHandler(private val context: Context) {
         synchronized(listeners) { listeners.remove(l) }
     }
 
-    /** Called by GlassesBleManager whenever BLE connection state changes. */
+    /** Called by GlassesBleManager when BLE connection state changes. */
     fun onConnectionChanged(connected: Boolean) {
         state.connected = connected
         InteractionLogger.logConnection("GLASSES", connected)
@@ -52,7 +49,7 @@ class GlassesMessageHandler(private val context: Context) {
         notifyListeners { it.onStateChanged(state.copy()) }
     }
 
-    /** Called by GlassesImagePipeline after spoken detection output is produced. */
+    /** Called by GlassesImagePipeline after a detection is spoken. */
     fun onDetectionSpoken(summary: String) {
         notifyListeners { it.onDetectionSpoken(summary) }
     }
@@ -69,7 +66,7 @@ class GlassesMessageHandler(private val context: Context) {
         notifyListeners { it.onStateChanged(state.copy()) }
     }
 
-    /** Called by GlassesImagePipeline after an image gets saved. */
+    /** Called by GlassesImagePipeline after an image is saved. */
     fun onImageSaved(uri: String) {
         notifyListeners { it.onImageSaved(uri) }
     }
@@ -77,17 +74,13 @@ class GlassesMessageHandler(private val context: Context) {
     fun getCurrentState(): GlassesState = state.copy()
 
     fun close() {
-        // Cleanup is owned by GlassesBleManager.close() (pipeline + speaker).
+        // GlassesBleManager.close() shuts down pipeline + speaker
     }
 
     private inline fun notifyListeners(action: (GlassesListener) -> Unit) {
         synchronized(listeners) {
             listeners.forEach {
-                try {
-                    action(it)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Listener error", e)
-                }
+                try { action(it) } catch (e: Exception) { Log.e(TAG, "Listener error", e) }
             }
         }
     }

@@ -9,26 +9,27 @@ import android.util.Log
 import java.util.UUID
 
 /**
- * BLE helper for OmiGlass smart glasses.
+ * Generic BLE connector for the OmiGlass smart glasses.
  *
- * This class handles scanning, connecting, and moving bytes over BLE.
- * The caller passes a [ConnectionListener] to react to connection events
- * and incoming data.
+ * Any Bluetooth-capable Android device can use this class to scan for,
+ * discover, and connect to the smart glasses over BLE.  The caller
+ * supplies a [ConnectionListener] to react to lifecycle events and
+ * incoming data.
  *
- * Quick usage:
+ * Usage:
  * ```
  * val connector = SmartGlassesBleConnector(
- *     context = this,
- *     config = SmartGlassesBleConnector.Config(),
- *     listener = myListener
+ *     context        = this,
+ *     config         = SmartGlassesBleConnector.Config(),   // defaults match ESP32-CAM firmware
+ *     listener       = myListener
  * )
- * connector.startScan()
- * connector.connect()
- * connector.writeCommand(0x01)
- * connector.disconnect()
+ * connector.startScan()          // find the glasses
+ * connector.connect()            // after onDeviceFound
+ * connector.writeCommand(0x01)   // send a single-byte command
+ * connector.disconnect()         // when done
  * ```
  *
- * All listener callbacks run on the main (UI) thread.
+ * All listener callbacks are delivered on the **main (UI) thread**.
  */
 class SmartGlassesBleConnector(
     private val context: Context,
@@ -36,19 +37,23 @@ class SmartGlassesBleConnector(
     private val listener: ConnectionListener
 ) {
 
-    // --- Config ---
+    // ───────────────────────────────── Configuration ─────────────────────────────────
 
     /**
-        * BLE settings you can tweak.
+     * Tuneable connection parameters.
      *
-        * @param deviceName Name to match while scanning.
-        *                   Set this to null if you want to match by service UUID instead.
-        * @param serviceUuid Primary GATT service UUID on the glasses.
-        * @param dataCharUuid Characteristic used for notifications (incoming data).
-        * @param controlCharUuid Characteristic used for writes (outgoing commands).
-        * @param cccdUuid CCCD descriptor UUID (standard BLE value).
-        * @param requestedMtu MTU size to request after connection.
-        * @param scanTimeoutMs Scan timeout in milliseconds.
+     * @param deviceName        Advertised name to match during scanning.
+     *                          Set to `null` to accept any device that
+     *                          advertises [serviceUuid].
+     * @param serviceUuid       Primary GATT service UUID on the glasses.
+     * @param dataCharUuid      Characteristic used for **notifications**
+     *                          (incoming data from glasses).
+     * @param controlCharUuid   Characteristic used for **writes**
+     *                          (commands sent to glasses).
+     * @param cccdUuid          Client Characteristic Configuration
+     *                          Descriptor UUID (standard BLE value).
+     * @param requestedMtu      MTU size to request after connection.
+     * @param scanTimeoutMs     How long to scan before giving up (ms).
      */
     data class Config(
         val deviceName: String? = "ESP32-CAM",
@@ -60,36 +65,36 @@ class SmartGlassesBleConnector(
         val scanTimeoutMs: Long = 15_000
     )
 
-    // --- Listener ---
+    // ───────────────────────────────── Listener ─────────────────────────────────────
 
     /**
-     * BLE callback interface.
-     * Every callback is posted to the main thread.
+     * Callback interface for BLE lifecycle events.
+     * All methods are called on the **main thread**.
      */
     interface ConnectionListener {
-        /** Called when we find a matching device. */
+        /** A matching device was found during scanning. */
         fun onDeviceFound(device: BluetoothDevice, name: String)
 
-        /** Called after GATT connects, before service discovery is done. */
+        /** GATT connection established; MTU negotiation starts next. */
         fun onConnecting()
 
-        /** Called when services are ready and notifications are enabled. */
+        /** Services discovered and notifications enabled – ready for commands. */
         fun onConnected(negotiatedMtu: Int)
 
-        /** Called when disconnected (expected or unexpected). */
+        /** Connection dropped or intentionally closed. */
         fun onDisconnected()
 
-        /** Called when data comes in from the data characteristic. */
+        /** New data arrived on the data characteristic. */
         fun onDataReceived(data: ByteArray)
 
-        /** Optional status text for logs or UI labels. */
+        /** Free-form status text (useful for debug / UI status labels). */
         fun onStatusMessage(message: String)
 
-        /** Called on errors. */
+        /** Something went wrong. */
         fun onError(message: String)
     }
 
-    // --- State ---
+    // ───────────────────────────────── State ─────────────────────────────────────────
 
     private val bluetoothAdapter: BluetoothAdapter? by lazy {
         (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
@@ -111,15 +116,14 @@ class SmartGlassesBleConnector(
     val foundDevice: BluetoothDevice?
         get() = targetDevice
 
-    // --- Public API ---
+    // ───────────────────────────────── Public API ────────────────────────────────────
 
     /**
-        * Start scanning for a BLE device.
+     * Begin scanning for a BLE device matching [Config.deviceName]
+     * (or [Config.serviceUuid] if deviceName is null).
      *
-        * If [Config.deviceName] is set, we match that name.
-        * Otherwise, we match by [Config.serviceUuid].
-        *
-        * Scan stops automatically after [Config.scanTimeoutMs] or when a match is found.
+     * Scanning stops automatically after [Config.scanTimeoutMs] or
+     * when a matching device is found.
      */
     fun startScan() {
         if (isScanning) return
@@ -143,7 +147,7 @@ class SmartGlassesBleConnector(
                 val match = if (config.deviceName != null) {
                     name == config.deviceName
                 } else {
-                    // No name filter: match devices advertising the service UUID.
+                    // Accept any device that advertises the target service UUID
                     result.scanRecord?.serviceUuids?.any { it.uuid == config.serviceUuid } == true
                 }
 
@@ -169,7 +173,7 @@ class SmartGlassesBleConnector(
         try {
             scanner.startScan(null, settings, callback)
 
-            // Auto-stop scanning after the timeout window.
+            // Auto-stop after timeout
             Handler(Looper.getMainLooper()).postDelayed({
                 if (isScanning) {
                     try { scanner.stopScan(callback) } catch (_: Exception) {}
@@ -189,7 +193,7 @@ class SmartGlassesBleConnector(
         }
     }
 
-    /** Stop a running scan. */
+    /** Stop an in-progress scan early. */
     fun stopScan() {
         if (!isScanning) return
         val scanner = bluetoothAdapter?.bluetoothLeScanner ?: return
@@ -200,8 +204,8 @@ class SmartGlassesBleConnector(
     }
 
     /**
-        * Connect to a device found by [startScan].
-        * You can also pass a [device] directly.
+     * Connect to the device previously found via [startScan].
+     * You may also set [targetDevice] manually before calling this.
      */
     fun connect(device: BluetoothDevice? = null) {
         val dev = device ?: targetDevice
@@ -221,7 +225,7 @@ class SmartGlassesBleConnector(
     }
 
     /**
-        * Write a single-byte command to the control characteristic.
+     * Write a single-byte command to the control characteristic.
      */
     fun writeCommand(command: Byte): Boolean {
         val gatt = bluetoothGatt ?: return false
@@ -236,7 +240,7 @@ class SmartGlassesBleConnector(
     }
 
     /**
-        * Write a byte array to the control characteristic.
+     * Write an arbitrary payload to the control characteristic.
      */
     fun writeCommand(payload: ByteArray): Boolean {
         val gatt = bluetoothGatt ?: return false
@@ -250,7 +254,7 @@ class SmartGlassesBleConnector(
         }
     }
 
-    /** Disconnect and clean up resources. */
+    /** Disconnect and release resources. */
     fun disconnect() {
         stopScan()
         try {
@@ -262,7 +266,7 @@ class SmartGlassesBleConnector(
         negotiatedMtu = 23
     }
 
-    // --- GATT callback ---
+    // ───────────────────────────────── GATT Callback ────────────────────────────────
 
     private val gattCallback = object : BluetoothGattCallback() {
 
@@ -304,7 +308,7 @@ class SmartGlassesBleConnector(
                 return
             }
 
-            // Turn on notifications for the data characteristic.
+            // Subscribe to data notifications
             val dataChar = service.getCharacteristic(config.dataCharUuid)
             controlCharacteristic = service.getCharacteristic(config.controlCharUuid)
 
@@ -331,7 +335,7 @@ class SmartGlassesBleConnector(
         }
     }
 
-    // --- Helpers ---
+    // ───────────────────────────────── Helpers ──────────────────────────────────────
 
     private fun postOnMain(action: () -> Unit) {
         Handler(Looper.getMainLooper()).post(action)

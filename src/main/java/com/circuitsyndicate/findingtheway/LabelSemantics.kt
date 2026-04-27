@@ -3,12 +3,7 @@ package com.circuitsyndicate.findingtheway
 import java.util.Locale
 
 /**
- * Shared label rules used by detector ranking and motion matching.
- *
- * Basic flow:
- * 1) normalize messy labels
- * 2) map aliases to one canonical form
- * 3) compare exact label / family label compatibility
+ * Shared label semantics used by detector ranking and motion matching.
  */
 object LabelSemantics {
 
@@ -18,7 +13,6 @@ object LabelSemantics {
         MISMATCH
     }
 
-    // Alias outputs from different models back to one canonical label.
     private val aliasToCanonical = mapOf(
         "office building" to "building",
         "tree house" to "building",
@@ -51,7 +45,6 @@ object LabelSemantics {
         "monitor" to "television"
     )
 
-    // Loose taxonomy so we can accept hierarchy-compatible matches.
     private val labelFamily = mapOf(
         "person" to "person",
         "man" to "person",
@@ -107,12 +100,7 @@ object LabelSemantics {
         "pole" to "street_fixture"
     )
 
-    private val stationaryFamilies = setOf(
-        "structure",
-        "flora",
-        "street_fixture",
-        "furniture"
-    )
+    private val stationaryFamilies = setOf("structure", "flora", "street_fixture", "furniture")
 
     private val stationaryAnchorCanonicalLabels = setOf(
         "building", "house", "window", "door", "wall", "roof", "ceiling", "floor",
@@ -122,7 +110,6 @@ object LabelSemantics {
         "clock", "television", "television monitor", "refrigerator", "oven", "sink", "toilet"
     )
 
-    // Backup signal for labels that are not in the exact canonical list.
     private val stationaryKeywordFragments = listOf(
         "window",
         "building",
@@ -191,17 +178,18 @@ object LabelSemantics {
         "furniture" to 0.70f
     )
 
-    fun normalize(label: String): String =
-        label
+    fun normalize(label: String): String {
+        return label
             .lowercase(Locale.US)
             .replace('_', ' ')
             .replace(Regex("[^a-z0-9\\s]"), " ")
             .replace(Regex("\\s+"), " ")
             .trim()
+    }
 
     fun canonicalLabel(label: String): String {
-        val cleaned = normalize(label)
-        return aliasToCanonical[cleaned] ?: cleaned
+        val normalized = normalize(label)
+        return aliasToCanonical[normalized] ?: normalized
     }
 
     fun compatibility(
@@ -212,26 +200,26 @@ object LabelSemantics {
     ): Compatibility {
         if (leftClassIndex == rightClassIndex) return Compatibility.EXACT
 
-        val leftCanon = canonicalLabel(leftLabel)
-        val rightCanon = canonicalLabel(rightLabel)
-        if (leftCanon == rightCanon) return Compatibility.HIERARCHY
+        val leftCanonical = canonicalLabel(leftLabel)
+        val rightCanonical = canonicalLabel(rightLabel)
+        if (leftCanonical == rightCanonical) return Compatibility.HIERARCHY
 
-        val leftGroup = labelFamily[leftCanon]
-        val rightGroup = labelFamily[rightCanon]
-        if (!leftGroup.isNullOrBlank() && leftGroup == rightGroup) {
+        val leftFamily = labelFamily[leftCanonical]
+        val rightFamily = labelFamily[rightCanonical]
+        if (!leftFamily.isNullOrBlank() && leftFamily == rightFamily) {
             return Compatibility.HIERARCHY
         }
         return Compatibility.MISMATCH
     }
 
     fun areHierarchyCompatible(leftLabel: String, rightLabel: String): Boolean {
-        val leftCanon = canonicalLabel(leftLabel)
-        val rightCanon = canonicalLabel(rightLabel)
-        if (leftCanon == rightCanon) return true
+        val leftCanonical = canonicalLabel(leftLabel)
+        val rightCanonical = canonicalLabel(rightLabel)
+        if (leftCanonical == rightCanonical) return true
 
-        val leftGroup = labelFamily[leftCanon]
-        val rightGroup = labelFamily[rightCanon]
-        return !leftGroup.isNullOrBlank() && leftGroup == rightGroup
+        val leftFamily = labelFamily[leftCanonical]
+        val rightFamily = labelFamily[rightCanonical]
+        return !leftFamily.isNullOrBlank() && leftFamily == rightFamily
     }
 
     fun isStationaryAnchor(label: String): Boolean {
@@ -248,7 +236,6 @@ object LabelSemantics {
     fun motionTrust(label: String): Float {
         val canonical = canonicalLabel(label)
         trustByCanonicalLabel[canonical]?.let { return it }
-
         val familyTrust = labelFamily[canonical]?.let { trustByFamily[it] }
         return familyTrust ?: 0.75f
     }

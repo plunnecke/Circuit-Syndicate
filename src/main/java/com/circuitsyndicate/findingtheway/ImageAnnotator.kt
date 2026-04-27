@@ -92,18 +92,7 @@ class ImageAnnotator {
         distResult: DistanceEstimator.DistanceResult?,
         color: Int
     ) {
-        val frameWidth = canvas.width.toFloat().coerceAtLeast(1f)
-        val frameHeight = canvas.height.toFloat().coerceAtLeast(1f)
-        val left = (det.boundingBox.left * frameWidth).coerceIn(0f, frameWidth)
-        val top = (det.boundingBox.top * frameHeight).coerceIn(0f, frameHeight)
-        val right = (det.boundingBox.right * frameWidth).coerceIn(0f, frameWidth)
-        val bottom = (det.boundingBox.bottom * frameHeight).coerceIn(0f, frameHeight)
-        val box = RectF(
-            left,
-            top,
-            if (right > left) right else (left + 1f).coerceAtMost(frameWidth),
-            if (bottom > top) bottom else (top + 1f).coerceAtMost(frameHeight)
-        )
+        val box = det.boundingBox
 
         // Bounding box
         boxPaint.color = color

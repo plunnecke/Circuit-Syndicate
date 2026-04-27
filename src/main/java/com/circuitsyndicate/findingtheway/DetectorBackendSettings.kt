@@ -9,8 +9,7 @@ object DetectorBackendSettings {
     private const val ONNX_MODEL_FILE = "yolov8m-oiv7.onnx"
     private val ONNX_MODEL_FALLBACK_FILES = listOf(
         "yolov8s-oiv7.onnx",
-        "yolov8n-oiv7.onnx",
-        "yolov8l-oiv7.onnx"
+        "yolov8n-oiv7.onnx"
     )
 
     private val DEFAULT_BACKEND = ObjectDetector.Backend.ONNX

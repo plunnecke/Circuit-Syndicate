@@ -625,13 +625,9 @@ class SettingsActivity : AppCompatActivity(),
             speak("System off. Haptics and sensors disabled.")
         } else {
             DeviceManager.setVestSystemEnabled(true)
-            withSuppression {
-                switchSystem.isChecked = true
-                switchHaptics.isChecked = true
-                switchSensors.isChecked = true
-            }
+            withSuppression { switchSystem.isChecked = true }
             applySubsystemControlLock(true)
-            Thread { VestCommandSender.sendAllOn() }.start()
+            VestCommandSender.sendAllOn()
             speak("System on.")
         }
         InteractionLogger.logStateChange("SYSTEM", isChecked, "APP")
@@ -731,17 +727,15 @@ class SettingsActivity : AppCompatActivity(),
     private fun validateGlassesCaptureForVestDisable(): Boolean {
         val glassesConnected = DeviceManager.isGlassesConnected()
         val glassesCaptureEnabled = GlassesCommandSender.isCaptureEnabled()
-        val glassesCaptureActive = GlassesCommandSender.isCaptureActivelyStreaming()
-        val gateValidated = DualConnectionSafetyPolicy.isGlassesCaptureValidatedForVestDisable(
+        val validated = DualConnectionSafetyPolicy.isGlassesCaptureValidatedForVestDisable(
             glassesConnected = glassesConnected,
             glassesCaptureEnabled = glassesCaptureEnabled
         )
-        val validated = gateValidated && glassesCaptureActive
 
         InteractionLogger.log(
             "SAFETY_VALIDATION",
             "APP",
-            "target=VEST_DISABLE glasses_connected=$glassesConnected glasses_capture_enabled=$glassesCaptureEnabled glasses_capture_active=$glassesCaptureActive validated=$validated"
+            "target=VEST_DISABLE glasses_connected=$glassesConnected glasses_capture_enabled=$glassesCaptureEnabled validated=$validated"
         )
         return validated
     }
@@ -794,7 +788,7 @@ class SettingsActivity : AppCompatActivity(),
 
         if (DeviceManager.isVestConnected()) {
             pendingVestForceOnOverrideAfterReconnect = false
-            Thread { VestCommandSender.sendAllOn() }.start()
+            VestCommandSender.sendAllOn()
         } else {
             pendingVestForceOnOverrideAfterReconnect = true
         }
@@ -1077,24 +1071,15 @@ class SettingsActivity : AppCompatActivity(),
                 .setTitle("Safety check")
                 .setMessage(message)
                 .setCancelable(false)
-                .setPositiveButton("Yes, glasses are on and taking pictures") { d, _ ->
-                    val validated = validateGlassesCaptureForVestDisable()
-                    if (validated) {
-                        VestCommandSender.confirmGlassesOn()
-                    } else {
-                        VestCommandSender.confirmGlassesOff()
-                        denyVestDisableWithoutChanges(
-                            reason = "Legacy vest safety prompt denied because runtime validation failed for glasses capture",
-                            spoken = "Safety validation failed. Smart glasses are not connected and taking pictures. No changes were made."
-                        )
-                    }
+                .setPositiveButton("Yes, glasses are on") { d, _ ->
+                    VestCommandSender.confirmGlassesOn()
                     d.dismiss()
                 }
                 .setNegativeButton("No, glasses are off") { d, _ ->
                     VestCommandSender.confirmGlassesOff()
-                    denyVestDisableWithoutChanges(
-                        reason = "Legacy vest safety prompt denied by user response: glasses capture not confirmed",
-                        spoken = "No changes were made. Haptics and sensors remain in their current state."
+                    forceVestSubsystemsOnForSafety(
+                        reason = "Legacy vest safety prompt denied in dual-connected state",
+                        spoken = "Safety override applied. Haptics and sensors remain on."
                     )
                     d.dismiss()
                 }
@@ -1174,7 +1159,7 @@ class SettingsActivity : AppCompatActivity(),
 
         if (vestConnected) {
             pendingVestForceOnOverrideAfterReconnect = false
-            Thread { VestCommandSender.sendAllOn() }.start()
+            VestCommandSender.sendAllOn()
             InteractionLogger.log(
                 "AUTO_OVERRIDE",
                 "APP",
@@ -1215,7 +1200,7 @@ class SettingsActivity : AppCompatActivity(),
             switchSensors.isChecked = true
         }
         applySubsystemControlLock(true)
-        Thread { VestCommandSender.sendAllOn() }.start()
+        VestCommandSender.sendAllOn()
 
         InteractionLogger.log(
             "AUTO_OVERRIDE",
@@ -1254,8 +1239,6 @@ class SettingsActivity : AppCompatActivity(),
             ContextCompat.getColor(this,
                 if (connected) R.color.success_green else R.color.error_red)
         )
-
-        applySubsystemControlLock(switchSystem.isChecked)
     }
 
     private fun refreshStatusSummary() {
@@ -1283,15 +1266,11 @@ class SettingsActivity : AppCompatActivity(),
     }
 
     private fun applySubsystemControlLock(systemOn: Boolean) {
-        val vestConnected = DeviceManager.isVestConnected()
-        switchSystem.isEnabled = vestConnected
-        switchSystem.alpha = if (vestConnected) 1.0f else 0.55f
+        val enabled = systemOn
+        switchHaptics.isEnabled = enabled
+        switchSensors.isEnabled = enabled
 
-        val subsystemEnabled = vestConnected && systemOn
-        switchHaptics.isEnabled = subsystemEnabled
-        switchSensors.isEnabled = subsystemEnabled
-
-        val alpha = if (subsystemEnabled) 1.0f else 0.55f
+        val alpha = if (enabled) 1.0f else 0.55f
         switchHaptics.alpha = alpha
         switchSensors.alpha = alpha
     }

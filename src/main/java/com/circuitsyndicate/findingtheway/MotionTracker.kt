@@ -8,34 +8,36 @@ import kotlin.math.ln
 import kotlin.math.sqrt
 
 /**
- * Quick motion tracker that compares YOLO detections across burst frames.
+ * Motion tracking via comparison of YOLO detections across burst-capture frames.
  *
- * Notes:
- * - Tries to chain matches across every neighboring frame pair.
- * - Falls back to centroid distance when IoU is too weak.
- * - Uses velocity per second (not per frame), so timing changes matter less.
- * - Uses hysteresis so one noisy burst does not instantly flip state.
- * - If camera compensation evidence is weak, directional state goes UNKNOWN.
+ * Features:
+ * - Chains matches across ALL consecutive frame pairs, accumulating shifts.
+ * - Falls back to centroid-distance matching when IoU fails.
+ * - Time-normalised velocity thresholds (shift per second, not per frame).
+ * - Temporal hysteresis: a motion state must persist across 2 consecutive
+ *   bursts before it is reported, eliminating single-burst noise.
+ * - Camera compensation degrades to UNKNOWN when < 2 matches exist.
  */
 class MotionTracker {
 
     companion object {
         private const val TAG = "MotionTracker"
 
-        // Velocity thresholds (per-second, normalized 0..1 image coords).
+        // ----- Velocity thresholds (per-second, normalised 0-1 coords) -----
         // At VGA 640 px, 0.06/s ≈ 38 px/s ≈ ~19 px in a 500 ms burst gap.
-        private const val VELOCITY_THRESHOLD = 0.06f          // base speed cutoff for motion
-        // Depth velocity (blended area + height log-rate) thresholds.
-        // Retreat is softer because shrink signals are usually noisier.
+        private const val VELOCITY_THRESHOLD = 0.06f          // minimum motion velocity
+        // Depth velocity (blended area+height log-rate) thresholds.
+        // Retreat uses a softer threshold because shrink cues are typically
+        // weaker than approach cues in perspective projection.
         private const val SIZE_VELOCITY_APPROACH = 0.22f
         private const val SIZE_VELOCITY_RETREAT = -0.14f
         private const val SIZE_VELOCITY_APPROACH_SOFT = 0.10f
         private const val SIZE_VELOCITY_RETREAT_SOFT = -0.07f
-        private const val DIRECTION_DOMINANCE_RATIO = 1.20f     // needs clear left/right dominance
-        private const val MIN_LATERAL_COMPONENT_RATIO = 0.60f   // ignore weak lateral sign flips
+        private const val DIRECTION_DOMINANCE_RATIO = 1.20f     // require clear lateral dominance
+        private const val MIN_LATERAL_COMPONENT_RATIO = 0.60f   // avoid weak lateral sign flips
         private const val MIN_CONFIDENCE_FOR_DIRECTIONAL = 0.45f
 
-        // Size-change stabilization to reduce jitter fake-outs.
+        // Size-change stabilization (suppresses jitter-driven depth motion).
         private const val SIZE_SIGNAL_MIN_AREA = 0.008f
         private const val SIZE_SIGNAL_FULL_AREA = 0.080f
         private const val SIZE_SIGNAL_ASPECT_HALF = 0.35f
@@ -48,16 +50,16 @@ class MotionTracker {
         private const val DEPTH_BLEND_SIZE_WEIGHT = 0.40f
         private const val DEPTH_BLEND_HEIGHT_WEIGHT = 0.60f
 
-        // Reference delta used for normalization (seconds).
+        // Reference time delta for normalisation (seconds).
         private const val REFERENCE_DT_S = 0.1f   // 100 ms
 
-        // IoU threshold for primary box matching.
+        // IoU threshold for primary bounding-box matching.
         private const val MATCH_IOU_THRESHOLD = 0.3f
 
         // Centroid-distance fallback (fraction of frame diagonal).
         private const val CENTROID_MATCH_THRESHOLD = 0.20f
 
-        // Intra-burst matching robustness weights/penalties.
+        // Intra-burst matching robustness.
         private const val MATCH_SIZE_CHANGE_WEIGHT = 0.25f
         private const val MATCH_ASPECT_CHANGE_WEIGHT = 0.15f
         private const val MATCH_CONFIDENCE_PENALTY_WEIGHT = 0.20f
@@ -70,17 +72,20 @@ class MotionTracker {
         private const val MATCH_MOTION_TRUST_BIAS_WEIGHT = 0.12f
         private const val MATCH_MAX_ACCEPT_COST = 1.45f
 
-        // Max total burst span (ms).
+        // Maximum burst time span (ms).
         const val MAX_FRAME_GAP_MS = 5000L
 
-        // Hysteresis: how many bursts in a row before confirming a new state.
-        private const val HYSTERESIS_COUNT = 1
+        // Temporal hysteresis: how many consecutive bursts a state must
+        // persist before it is promoted from UNKNOWN to that state.
+        private const val HYSTERESIS_COUNT = 2
 
-        // Persistent registry timeout (ms).
-        // 3 burst intervals (3 x 30 s = 90 s) gives some tolerance for misses.
+        // Persistent registry: expire entries older than this (ms).
+        // 3 burst intervals (3 × 30 s = 90 s) gives tolerance for
+        // occasional missed detections while still expiring stale objects.
         private const val REGISTRY_STALE_MS = 90_000L
 
-        // Cross-burst matching thresholds (looser than intra-burst).
+        // Cross-burst matching thresholds (looser than intra-burst
+        // because 30 s elapsed and the object may have moved)
         private const val CROSS_BURST_IOU_THRESHOLD = 0.15f
         private const val CROSS_BURST_CENTROID_THRESHOLD = 0.30f
         private const val CROSS_BURST_SIZE_CHANGE_WEIGHT = 0.30f
@@ -98,21 +103,22 @@ class MotionTracker {
         private const val MOTION_TRUST_MIN = 0.45f
         private const val MOTION_TRUST_MAX = 1.20f
 
-        // Kalman tuning constants.
+        // Kalman filter tuning constants
         private const val KALMAN_ACCEL_NOISE = 0.5f        // acceleration noise spectral density
         private const val KALMAN_MEAS_NOISE_POS = 0.002f   // position measurement noise variance
         private const val KALMAN_MEAS_NOISE_AREA = 0.005f  // area measurement noise variance
 
-        // Distance thresholds (feet) for threat-level logic.
-        // Close range uses softer velocity gates, far range uses stricter ones.
+        // Distance thresholds (feet) for threat-level classification.
+        // Close range uses softer velocity thresholds (even slow approach is
+        // dangerous), while far range requires stronger evidence of approach.
         private const val CLOSE_RANGE_FT  =  5f
         private const val MEDIUM_RANGE_FT = 15f
         // Velocity threshold multipliers per distance band.
-        // < 1 lowers the bar; > 1 raises it.
+        // < 1 means lower bar for motion → easier to trigger.
         private const val CLOSE_RANGE_VEL_SCALE  = 0.5f   // half the normal threshold at close range
         private const val FAR_RANGE_VEL_SCALE    = 1.5f   // 50% harder to trigger at far range
 
-        // Camera compensation confidence rules.
+        // Camera compensation trust hierarchy.
         private const val EXTERNAL_MIN_CONFIDENCE = 0.30f
         private const val EXTERNAL_STRONG_CONFIDENCE = 0.70f
         private const val INTERNAL_MIN_CONFIDENCE = 0.30f
@@ -120,15 +126,14 @@ class MotionTracker {
         private const val INTERNAL_ALL_MATCH_PENALTY = 0.35f
         private const val INTERNAL_MIN_ALL_MATCH_SUPPORT = 3
 
-        // Rules for degrading under-constrained evidence.
-        private const val MIN_CHAIN_OBSERVATIONS_FOR_MOTION = 2
-        private const val MIN_CHAIN_PAIR_SUPPORT = 1
-        private const val MIN_COMPENSATION_RELIABILITY_FOR_DIRECTIONAL = 0.35f
+        // Underconstrained-evidence degradation rules.
+        private const val MIN_CHAIN_OBSERVATIONS_FOR_MOTION = 3
+        private const val MIN_CHAIN_PAIR_SUPPORT = 2
+        private const val MIN_COMPENSATION_RELIABILITY_FOR_DIRECTIONAL = 0.45f
         private const val NO_COMP_STRONG_MOTION_FACTOR = 2.0f
-        // Let depth-direction survive one dropped chunk in a short burst.
-        private const val MIN_CHAIN_OBSERVATIONS_FOR_DEPTH_DIRECTIONAL = 2
-        private const val MIN_CHAIN_PAIR_SUPPORT_FOR_DEPTH_DIRECTIONAL = 1
-        private const val HYSTERESIS_DEPTH_FLIP_COUNT = 2
+        private const val MIN_CHAIN_OBSERVATIONS_FOR_DEPTH_DIRECTIONAL = 4
+        private const val MIN_CHAIN_PAIR_SUPPORT_FOR_DEPTH_DIRECTIONAL = 3
+        private const val HYSTERESIS_DEPTH_FLIP_COUNT = 3
 
         // Distance-rate fusion thresholds (feet/second, positive = approaching).
         private const val DISTANCE_RATE_STALE_MS = 60_000L
@@ -165,19 +170,20 @@ class MotionTracker {
     }
 
     /**
-     * Threat level from distance + motion.
-     * Main point is to separate "close and approaching" from "far and slow".
+     * Fused threat level combining distance and motion state.
+     * Enables assistive systems to distinguish e.g. "approaching fast
+     * at close range" (CRITICAL) from "approaching slowly far away" (LOW).
      */
     enum class ThreatLevel {
-        /** Approaching/crossing and very close (< 5 ft). */
+        /** Approaching/crossing at close range (< 5 ft) */
         CRITICAL,
-        /** Approaching at medium range, or notable motion nearby. */
+        /** Approaching at medium range OR any motion at close range */
         HIGH,
-        /** Nearby but not clearly critical yet. */
+        /** Stationary at close range, or approaching from far away */
         MODERATE,
-        /** Lower concern: far, stationary, moving away, or unclear. */
+        /** Stationary at medium/far range, moving away, or unknown */
         LOW,
-        /** Not enough info to score. */
+        /** Insufficient data to assess threat */
         UNKNOWN
     }
 
@@ -189,17 +195,18 @@ class MotionTracker {
         val motionState: MotionState,
         val motionMagnitude: Float,
         val trackId: Int = -1,
-        /** Estimated distance in feet, null if not available. */
+        /** Estimated distance in feet, or null if unavailable. */
         val distanceFeet: Float? = null,
-        /** Fused threat level from motion + distance. */
+        /** Fused threat level incorporating both motion and distance. */
         val threatLevel: ThreatLevel = ThreatLevel.UNKNOWN
     )
 
     // ------------------------------------------------------------------
-    // Persistent object registry (kept across bursts)
+    // Persistent object registry (survives across bursts)
     // ------------------------------------------------------------------
-    // Each entry is a known object that we keep between burst intervals,
-    // using a growing persistent ID.
+    // Each entry represents a known physical object persisted across
+    // 30-second burst intervals, keyed by a monotonically increasing
+    // persistent ID that never resets.
     private data class PersistentEntry(
         val classIndex: Int,
         val label: String,
@@ -211,16 +218,17 @@ class MotionTracker {
     private val persistentRegistry = mutableMapOf<Int, PersistentEntry>()
 
     // ------------------------------------------------------------------
-    // Temporal hysteresis state (also kept across bursts)
+    // Temporal hysteresis state (survives across bursts)
     // ------------------------------------------------------------------
-    // Key format: "persistent:$persistentId".
+    // Key = "persistent:$persistentId" — stable across bursts because
+    // persistent IDs are re-used for the same physical object.
     private data class StateHistory(var lastState: MotionState, var streak: Int)
     private val stateHistory = mutableMapOf<String, StateHistory>()
 
-    // Kalman state per persistent object.
+    // Kalman filter states keyed by persistent ID (survives across bursts)
     private val kalmanStates = mutableMapOf<Int, KalmanObjectState>()
 
-    // Tracking fields for diagnostics.
+    // Observability state for cross-burst diagnostics.
     private var diagnosticsBurstCounter = 0L
     private val lastConfirmedStateByPersistent = mutableMapOf<Int, MotionState>()
     private data class DistanceTrendEntry(
@@ -234,7 +242,7 @@ class MotionTracker {
     private val distanceTrendByPersistent = mutableMapOf<Int, DistanceTrendEntry>()
 
     // ------------------------------------------------------------------
-    // Accumulated motion for one object across frame pairs.
+    // Internal: accumulated motion data for one object across frame pairs
     // ------------------------------------------------------------------
     private data class AccumulatedMotion(
         var velocitySumX: Float = 0f,
@@ -333,12 +341,13 @@ class MotionTracker {
     }
 
     // ------------------------------------------------------------------
-    // Kalman filter bits for smoother velocity + prediction.
+    // Kalman filter for smooth velocity estimation and prediction
     // ------------------------------------------------------------------
 
     /**
-     * Simple 1D constant-velocity Kalman filter with state [position, velocity].
-     * Process noise scales with dt, so long gaps naturally add uncertainty.
+     * 1D constant-velocity Kalman filter with state [position, velocity].
+     * Uses a continuous white-noise acceleration process model so that
+     * process noise scales naturally with the prediction interval.
      */
     private class Kalman1D {
         var pos: Float = 0f
@@ -355,7 +364,10 @@ class MotionTracker {
             pPos = posVar; pVel = velVar; pCross = 0f
         }
 
-        /** Predict state forward by [dt] seconds. */
+        /**
+         * Predict state forward by [dt] seconds.
+         * @param q  acceleration-noise spectral density
+         */
         fun predict(dt: Float, q: Float = KALMAN_ACCEL_NOISE) {
             pos += vel * dt
             val dt2 = dt * dt; val dt3 = dt2 * dt
@@ -364,7 +376,7 @@ class MotionTracker {
             pVel  += q * dt
         }
 
-        /** Update from a position measurement. */
+        /** Incorporate a position observation. */
         fun updatePosition(measurement: Float, r: Float = KALMAN_MEAS_NOISE_POS) {
             val y = measurement - pos
             val s = pPos + r
@@ -378,7 +390,7 @@ class MotionTracker {
             if (pVel < 1e-8f) pVel = 1e-8f
         }
 
-        /** Update from a direct velocity measurement (from burst analysis). */
+        /** Incorporate a direct velocity observation (from burst analysis). */
         fun updateVelocity(measuredVel: Float, r: Float = 0.01f) {
             val y = measuredVel - vel
             val s = pVel + r
@@ -393,13 +405,14 @@ class MotionTracker {
             if (pVel < 1e-8f) pVel = 1e-8f
         }
 
-          /** Velocity standard deviation (sqrt of velocity variance). */
+        /** Velocity standard deviation (sqrt of velocity variance). */
         val velStdDev: Float get() = sqrt(maxOf(pVel, 1e-8f))
     }
 
     /**
-      * Per-object Kalman wrapper with separate filters for x, y, and area.
-      * Gives smoothed velocity, forward position prediction, and confidence.
+     * Per-object Kalman state wrapping independent filters for x, y and area.
+     * Provides smoothed velocity estimates, position prediction for
+     * cross-burst matching, and a scalar velocity-confidence score.
      */
     private class KalmanObjectState {
         val kx = Kalman1D()
@@ -416,7 +429,7 @@ class MotionTracker {
             initialized = true
         }
 
-        /** Standard predict-then-update step with a new observation. */
+        /** Predict-then-update with a new position/area observation. */
         fun update(cx: Float, cy: Float, area: Float, timestampMs: Long) {
             if (!initialized) { initialize(cx, cy, area, timestampMs); return }
             val dt = maxOf((timestampMs - lastUpdateMs) / 1000f, 0.010f)
@@ -427,14 +440,14 @@ class MotionTracker {
             lastUpdateMs = timestampMs
         }
 
-        /** Inject velocity from frame-pair analysis inside the burst. */
+        /** Inject a velocity observation from within-burst frame-pair analysis. */
         fun updateWithVelocity(velX: Float, velY: Float, areaRate: Float) {
             kx.updateVelocity(velX)
             ky.updateVelocity(velY)
             kArea.updateVelocity(areaRate, r = 0.05f)
         }
 
-        /** Predict centroid at [futureMs] without mutating internal state. */
+        /** Predict centroid position at [futureMs] without modifying state. */
         fun predictPosition(futureMs: Long): PointF {
             val dt = maxOf((futureMs - lastUpdateMs) / 1000f, 0f)
             return PointF(kx.pos + kx.vel * dt, ky.pos + ky.vel * dt)
@@ -446,7 +459,8 @@ class MotionTracker {
 
         /**
          * Confidence in velocity estimate (0 = uncertain, 1 = confident).
-         * Derived from velocity variance in the Kalman state.
+         * Based on the combined velocity standard deviation from the
+         * Kalman covariance matrices.
          */
         val velocityConfidence: Float get() {
             val s = sqrt(kx.velStdDev * kx.velStdDev + ky.velStdDev * ky.velStdDev)
@@ -455,7 +469,7 @@ class MotionTracker {
     }
 
     /**
-     * Analyze motion across one burst of detection frames.
+     * Analyse motion across a burst of detection frames.
      */
     fun analyzeMotion(
         frameDetections: List<List<ObjectDetector.Detection>>,
@@ -465,28 +479,26 @@ class MotionTracker {
     ): List<TrackedDetection> {
         if (frameDetections.isEmpty()) return emptyList()
         val burstDiagId = ++diagnosticsBurstCounter
-        val fallbackTimestamp = frameTimestamps.lastOrNull() ?: System.currentTimeMillis()
 
         if (frameDetections.size == 1) {
-            return approximateMotionFromHistory(
-                burstDiagId = burstDiagId,
-                detections = frameDetections[0],
-                burstTimestamp = fallbackTimestamp,
-                reason = "single_frame"
+            Log.i(
+                TAG,
+                "MOTION_DIAG burst=$burstDiagId shortBurst=true reason=single_frame " +
+                    "detections=${frameDetections[0].size}"
             )
+            return frameDetections[0].map { it.toTracked(MotionState.UNKNOWN, 0f) }
         }
 
-        // Skip motion calc if the burst spans too much time.
+        // Reject if total time span is too large
         if (frameTimestamps.size >= 2) {
             val totalGap = frameTimestamps.last() - frameTimestamps.first()
             if (totalGap > MAX_FRAME_GAP_MS) {
                 Log.w(TAG, "Frame gap ${totalGap}ms exceeds max, suppressing motion")
-                return approximateMotionFromHistory(
-                    burstDiagId = burstDiagId,
-                    detections = frameDetections.last(),
-                    burstTimestamp = fallbackTimestamp,
-                    reason = "frame_gap_${totalGap}ms"
+                Log.i(
+                    TAG,
+                    "MOTION_DIAG burst=$burstDiagId suppressed=true reason=frame_gap totalGapMs=$totalGap"
                 )
+                return frameDetections.last().map { it.toTracked(MotionState.UNKNOWN, 0f) }
             }
         }
 
@@ -505,7 +517,7 @@ class MotionTracker {
             val prevIds = chainIds[f - 1]
             val currIds = IntArray(currDets.size) { -1 }
 
-            // Time delta for this pair (seconds), clamped to avoid divide-by-zero.
+            // Time delta for this pair (seconds); clamp to avoid div-by-zero
             val dtMs = (frameTimestamps.getOrElse(f) { frameTimestamps.last() }
                       - frameTimestamps.getOrElse(f - 1) { frameTimestamps.first() })
             val dtSec = maxOf(dtMs / 1000f, 0.010f)  // min 10 ms
@@ -524,7 +536,8 @@ class MotionTracker {
                 val velY = shift.y / dtSec
                 val vel = PointF(velX, velY)
                 allPairVelocities.add(vel)
-                // Keep stationary-anchor velocities separately for better ego-motion.
+                // Track velocities from stationary scene features separately
+                // for more robust ego-motion estimation.
                 if (LabelSemantics.isStationaryAnchor(currDet.label)) {
                     val trust = LabelSemantics.motionTrust(currDet.label)
                         .coerceIn(MOTION_TRUST_MIN, MOTION_TRUST_MAX)
@@ -568,8 +581,10 @@ class MotionTracker {
             }
             chainIds[f] = currIds
 
-            // Estimate camera ego-motion for this pair.
-            // Stationary anchors are preferred; all-object fallback is penalized.
+            // Camera ego-motion estimation for this frame pair.
+            // Stationary anchors are trusted most; all-object fallback is
+            // allowed only with higher support and receives a confidence
+            // penalty to avoid canceling true object motion.
             if (stationaryPairVelocities.size >= 2) {
                 val stationaryWeightSum = stationaryPairVelocities
                     .sumOf { it.weight.toDouble() }
@@ -632,7 +647,7 @@ class MotionTracker {
             }
         }
 
-        // Collapse pair-wise estimates into one internal camera velocity.
+        // Global camera velocity from detection-only tracker.
         val internalGlobalCamVel = if (perPairCameraMotions.isNotEmpty()) {
             PointF(
                 perPairCameraMotions.map { it.velocity.x }.sorted()[perPairCameraMotions.size / 2],
@@ -659,8 +674,8 @@ class MotionTracker {
             avgPairConfidence * pairCoverage * (0.5f + 0.5f * stationaryRatio)
         ).coerceIn(0f, 1f)
 
-        // Blend optional external estimate with internal detection-based estimate.
-        // Priority: strong external > blended > strong internal > none.
+        // Blend optional sparse-background estimate with detection-only estimate.
+        // Priority: strong external > blended confident estimates > strong internal > none.
         val externalConf = externalCameraConfidence.coerceIn(0f, 1f)
         val externalVel = externalCameraVelocity ?: PointF(0f, 0f)
         val externalUsable = externalCameraVelocity != null && externalConf >= EXTERNAL_MIN_CONFIDENCE
@@ -722,12 +737,12 @@ class MotionTracker {
                     "compReliable=$compensationReliable final=(${globalCamVel.x}, ${globalCamVel.y})"
         )
 
-        // ---- Assign persistent IDs using cross-burst registry ----
+        // ---- Assign persistent IDs via cross-burst registry ----
         val lastDets = frameDetections[numFrames - 1]
         val lastIds = chainIds[numFrames - 1]
         val burstTimestamp = frameTimestamps.last()
 
-        // Drop stale registry entries and related state.
+        // Expire stale registry entries and associated Kalman/hysteresis state
         val expiredPids = persistentRegistry.entries
             .filter { burstTimestamp - it.value.lastSeenMs > REGISTRY_STALE_MS }
             .map { it.key }
@@ -743,7 +758,8 @@ class MotionTracker {
         val registryBeforeLabels = persistentRegistry.values.map { it.label }.toSet()
 
         // Map each final-frame detection to a persistent ID.
-        // First pass tries matching against existing registry entries.
+        // First, match against the existing registry using a conservative
+        // Hungarian approach (IoU + centroid + geometry penalties).
         val persistentIds = matchToPersistentRegistry(lastDets, burstTimestamp)
         val registryNewCount = persistentIds.count { it !in registryBeforeKeys }
         val registryMatchedCount = persistentIds.size - registryNewCount
@@ -840,7 +856,7 @@ class MotionTracker {
                 }
             }
 
-            // Fallback velocity update when trajectory support is thin.
+            // Fallback velocity observation when trajectory support is sparse.
             val motion = accumulated[chainId]
             if (observations.size < 2 && motion != null && motion.pairCount > 0) {
                 kState.updateWithVelocity(motion.avgVelX, motion.avgVelY, motion.avgDepthVel)
@@ -860,7 +876,8 @@ class MotionTracker {
             val tracked: TrackedDetection
 
             if (motion != null && motion.pairCount > 0) {
-                // Prefer Kalman-smoothed velocity; otherwise use raw burst averages.
+                // Use Kalman-smoothed velocities when available for stable
+                // estimates; fall back to raw burst averages otherwise.
                 val residualVelX: Float
                 val residualVelY: Float
                 val sizeVel: Float
@@ -870,7 +887,7 @@ class MotionTracker {
                 val kState = kalmanStates[pid]
 
                 if (kState != null && kState.initialized) {
-                    // Kalman is in raw image coords, so subtract camera velocity.
+                    // Kalman tracks in raw image coords; subtract camera vel.
                     residualVelX = kState.smoothedVelX - globalCamVel.x
                     residualVelY = kState.smoothedVelY - globalCamVel.y
                     sizeVel = kState.smoothedAreaRate
@@ -887,7 +904,7 @@ class MotionTracker {
                 }
 
                 val residualSpeed = sqrt(residualVelX * residualVelX + residualVelY * residualVelY)
-                // Convert speed back to reference-frame magnitude for output.
+                // Convert back to per-reference-frame magnitude for motionMagnitude output
                 val residualMag = residualSpeed * REFERENCE_DT_S
                 val motionTrust = motionTrust(det.label)
 
@@ -959,91 +976,15 @@ class MotionTracker {
         return trackedDetections
     }
 
-    private fun approximateMotionFromHistory(
-        burstDiagId: Long,
-        detections: List<ObjectDetector.Detection>,
-        burstTimestamp: Long,
-        reason: String
-    ): List<TrackedDetection> {
-        if (detections.isEmpty()) {
-            Log.i(
-                TAG,
-                "MOTION_DIAG burst=$burstDiagId shortBurst=true reason=$reason detections=0"
-            )
-            return emptyList()
-        }
-
-        val expiredPids = persistentRegistry.entries
-            .filter { burstTimestamp - it.value.lastSeenMs > REGISTRY_STALE_MS }
-            .map { it.key }
-        expiredPids.forEach { pid ->
-            persistentRegistry.remove(pid)
-            kalmanStates.remove(pid)
-            stateHistory.remove("persistent:$pid")
-            lastConfirmedStateByPersistent.remove(pid)
-            distanceTrendByPersistent.remove(pid)
-        }
-
-        val persistentIds = matchToPersistentRegistry(detections, burstTimestamp)
-
-        val tracked = detections.mapIndexed { index, det ->
-            val pid = persistentIds[index]
-            val history = stateHistory["persistent:$pid"]
-            val approximatedState = when {
-                lastConfirmedStateByPersistent.containsKey(pid) ->
-                    lastConfirmedStateByPersistent[pid] ?: MotionState.UNKNOWN
-                history?.lastState != null && history.lastState != MotionState.UNKNOWN ->
-                    history.lastState
-                else -> MotionState.UNKNOWN
-            }
-
-            val motionMagnitude = if (approximatedState == MotionState.UNKNOWN) {
-                0f
-            } else {
-                VELOCITY_THRESHOLD * REFERENCE_DT_S
-            }
-
-            val centerX = (det.boundingBox.left + det.boundingBox.right) / 2f
-            val centerY = (det.boundingBox.top + det.boundingBox.bottom) / 2f
-            val area = areaOf(det.boundingBox)
-            val kState = kalmanStates.getOrPut(pid) { KalmanObjectState() }
-            if (!kState.initialized) {
-                kState.initialize(centerX, centerY, area, burstTimestamp)
-            } else {
-                kState.update(centerX, centerY, area, burstTimestamp)
-            }
-
-            lastConfirmedStateByPersistent[pid] = approximatedState
-
-            TrackedDetection(
-                label = det.label,
-                confidence = det.confidence,
-                boundingBox = det.boundingBox,
-                classIndex = det.classIndex,
-                motionState = approximatedState,
-                motionMagnitude = motionMagnitude,
-                trackId = pid
-            )
-        }
-
-        val approximatedKnown = tracked.count { it.motionState != MotionState.UNKNOWN }
-        Log.i(
-            TAG,
-            "MOTION_DIAG burst=$burstDiagId shortBurst=true reason=$reason detections=${detections.size} " +
-                "approximated_known=$approximatedKnown registry_size=${persistentRegistry.size}"
-        )
-
-        return tracked
-    }
-
     // ------------------------------------------------------------------
-    // Cross-burst persistent registry matching.
+    // Cross-burst persistent registry matching
     // ------------------------------------------------------------------
     /**
      * Match final-frame detections against the persistent registry.
-     * Uses Hungarian assignment with looser thresholds because objects can
-     * move a lot in ~30s. Matched detections keep their persistent IDs,
-     * unmatched detections get new ones.
+     * Uses Hungarian assignment with looser thresholds (objects can
+     * move significantly in 30 s).  Matched detections inherit a
+     * persistent ID; unmatched detections receive a new one.  The
+     * registry is then updated with current positions.
      */
     private fun matchToPersistentRegistry(
         detections: List<ObjectDetector.Detection>,
@@ -1052,7 +993,7 @@ class MotionTracker {
         val pids = IntArray(detections.size) { -1 }
 
         if (persistentRegistry.isEmpty()) {
-            // First burst: just assign fresh persistent IDs.
+            // First burst ever — assign fresh persistent IDs
             for (i in detections.indices) {
                 val pid = nextPersistentId++
                 pids[i] = pid
@@ -1067,7 +1008,7 @@ class MotionTracker {
             return pids
         }
 
-        // Build cost matrix [detIdx][registrySlot].
+        // Build cost matrix [detIdx][registrySlot]
         val regEntries = persistentRegistry.entries.toList()  // stable order
         val nDet = detections.size
         val nReg = regEntries.size
@@ -1085,7 +1026,9 @@ class MotionTracker {
                     rightClassIndex = entry.classIndex
                 )
 
-                // If Kalman is available, use predicted position for matching.
+                // Use Kalman-predicted position when available for more
+                // accurate cross-burst matching (objects may have moved
+                // significantly during the ~30 s inter-burst interval).
                 val kState = kalmanStates[regEntries[ri].key]
                 val matchBox = if (kState != null && kState.initialized) {
                     val predicted = kState.predictPosition(timestampMs)
@@ -1155,13 +1098,13 @@ class MotionTracker {
 
         val assignment = hungarianAssignment(cost, n)
 
-        // Assign persistent IDs from accepted matches.
+        // Assign persistent IDs from matches
         for (di in detections.indices) {
             val ri = assignment[di]
             if (ri < nReg && cost[di][ri] < INF && cost[di][ri] <= CROSS_BURST_MAX_ACCEPT_COST) {
                 val pid = regEntries[ri].key
                 pids[di] = pid
-                // Update registry entry with current detection.
+                // Update the registry entry with current position
                 persistentRegistry[pid] = PersistentEntry(
                     classIndex = detections[di].classIndex,
                     label = detections[di].label,
@@ -1173,7 +1116,7 @@ class MotionTracker {
             }
         }
 
-        // Assign new persistent IDs to unmatched detections.
+        // Assign new persistent IDs for unmatched detections
         for (di in detections.indices) {
             if (pids[di] < 0) {
                 val pid = nextPersistentId++
@@ -1192,20 +1135,21 @@ class MotionTracker {
     }
 
     // ------------------------------------------------------------------
-    // Temporal hysteresis.
+    // Temporal hysteresis
     // ------------------------------------------------------------------
     private data class HysteresisResult(
         val tracked: TrackedDetection,
         val flipGuardSuppressed: Boolean
     )
 
-     /**
-      * A new state only gets promoted after it appears for
-      * [HYSTERESIS_COUNT] consecutive bursts. Until then, we keep
-      * the previous confirmed state (or UNKNOWN).
-      *
-      * Keys use persistent IDs so the same object keeps its streak across bursts.
-      */
+    /**
+     * A new motion state is only promoted once it has been observed for
+     * [HYSTERESIS_COUNT] consecutive bursts.  Until then, the previous
+     * confirmed state (or UNKNOWN) is returned.
+     *
+     * Keys use persistent IDs so that the same physical object
+     * accumulates streak counts across 30-second burst intervals.
+     */
     private fun applyHysteresis(
         det: ObjectDetector.Detection,
         persistentId: Int,
@@ -1256,13 +1200,16 @@ class MotionTracker {
     }
 
     // ------------------------------------------------------------------
-    // Motion classification (velocity-based thresholds).
+    // Motion classification (velocity-based thresholds)
     // ------------------------------------------------------------------
     /**
      * Classify object motion from residual (camera-compensated) velocity.
      *
-     * @param confidence Kalman velocity confidence (0-1). Low confidence
-     * raises the threshold so noisy estimates do not trigger false positives.
+     * @param confidence Kalman velocity confidence (0-1).  When the filter
+     *   is uncertain (low confidence), the effective motion threshold is
+     *   raised so that noisy estimates don't produce false positives.
+     *   Approaching/receding classification similarly requires stronger
+     *   evidence when confidence is low.
      */
     private fun classifyMotion(
         residualSpeed: Float,
@@ -1276,20 +1223,23 @@ class MotionTracker {
             confidence.coerceIn(0f, 1f) * motionTrust.coerceIn(MOTION_TRUST_MIN, MOTION_TRUST_MAX)
             ).coerceIn(0.15f, 1.25f)
 
-        // Lower confidence means we require stronger motion.
+        // Scale threshold inversely with confidence: uncertain velocity
+        // needs stronger motion to be classified as non-stationary.
         val adjustedThreshold = VELOCITY_THRESHOLD / maxOf(trustedConfidence, 0.2f)
         if (residualSpeed < adjustedThreshold) return MotionState.STATIONARY
 
-        // Weight depth velocity by confidence for approach/retreat.
+        // Weight depth-velocity by confidence for approach/retreat decisions
         val effectiveDepthVel = depthVelocity * trustedConfidence
         val absX = abs(residualVelX)
         val absY = abs(residualVelY)
 
-        // Strong depth cue can decide approach/retreat directly.
+        // Strong depth cues can classify approach/retreat regardless of
+        // lateral direction ambiguity.
         if (effectiveDepthVel > SIZE_VELOCITY_APPROACH) return MotionState.APPROACHING
         if (effectiveDepthVel < SIZE_VELOCITY_RETREAT) return MotionState.MOVING_AWAY
 
-        // With low confidence, require at least soft depth evidence.
+        // Low-confidence directional cues are treated as uncertain unless
+        // there is at least soft size evidence for depth motion.
         if (trustedConfidence < MIN_CONFIDENCE_FOR_DIRECTIONAL &&
             abs(effectiveDepthVel) < SIZE_VELOCITY_APPROACH_SOFT
         ) {
@@ -1345,7 +1295,7 @@ class MotionTracker {
     }
 
     // ------------------------------------------------------------------
-    // Detection matching: IoU first, centroid fallback.
+    // Detection matching: IoU-first with centroid-distance fallback
     // ------------------------------------------------------------------
     private data class MatchResult(
         val prev: ObjectDetector.Detection,
@@ -1354,21 +1304,23 @@ class MotionTracker {
         val prevIdx: Int
     )
 
-     /**
-      * Match detections between consecutive frames using global assignment
-      * (Hungarian) and a combined cost of IoU, centroid distance, and
-      * geometry consistency penalties.
-      *
-      * This avoids the order-dependent mistakes that greedy matching can make.
-      */
+    /**
+     * Match detections between two consecutive frames using globally
+     * optimal assignment (Hungarian algorithm) with a combined cost
+    * of IoU, centroid distance, and geometry consistency penalties.
+     *
+     * This replaces the previous greedy two-pass approach and avoids
+     * order-dependent mis-associations in crowded scenes.
+     */
     private fun matchDetections(
         prev: List<ObjectDetector.Detection>,
         curr: List<ObjectDetector.Detection>
     ): List<MatchResult> {
         if (prev.isEmpty() || curr.isEmpty()) return emptyList()
 
-        // Build cost matrix [currIdx][prevIdx] with IoU-first matching,
-        // centroid fallback, and extra penalties for weak consistency.
+        // Build cost matrix [currIdx][prevIdx]. Cost uses IoU-first with
+        // centroid fallback and additional penalties for size/aspect drift,
+        // low confidence, and class mismatch.
         val INF = 1e9f
         val nCurr = curr.size
         val nPrev = prev.size
@@ -1427,10 +1379,10 @@ class MotionTracker {
             }
         }
 
-        // Run Hungarian algorithm on the padded square matrix.
+        // Run Hungarian algorithm on the (padded) square matrix
         val assignment = hungarianAssignment(cost, n)
 
-        // Collect valid matches.
+        // Collect valid matches
         val result = mutableListOf<MatchResult>()
         for (ci in curr.indices) {
             val pi = assignment[ci]
@@ -1453,11 +1405,11 @@ class MotionTracker {
     }
 
     // ------------------------------------------------------------------
-    // Hungarian (Kuhn-Munkres) algorithm, O(n^3).
-    // Returns assignment[row] = col for a square n x n cost matrix.
+    // Hungarian (Kuhn–Munkres) algorithm  –  O(n³)
+    // Returns assignment[row] = col for a square n×n cost matrix.
     // ------------------------------------------------------------------
     private fun hungarianAssignment(cost: Array<FloatArray>, n: Int): IntArray {
-        // u/v are potentials; p/way track the augmenting path.
+        // u, v = potentials;  p, way = augmenting-path bookkeeping
         val u = FloatArray(n + 1)
         val v = FloatArray(n + 1)
         val p = IntArray(n + 1)                   // p[j] = row assigned to col j
@@ -1500,7 +1452,7 @@ class MotionTracker {
                 j0 = j1
             } while (p[j0] != 0)
 
-            // Unwind the augmenting path.
+            // Unwind augmenting path
             while (j0 != 0) {
                 val j1 = way[j0]
                 p[j0] = p[j1]
@@ -1508,7 +1460,7 @@ class MotionTracker {
             }
         }
 
-        // Build row-to-col assignment (0-indexed).
+        // Build row→col assignment (0-indexed)
         val ans = IntArray(n) { -1 }
         for (j in 1..n) {
             if (p[j] > 0) ans[p[j] - 1] = j - 1
@@ -1517,7 +1469,7 @@ class MotionTracker {
     }
 
     // ------------------------------------------------------------------
-    // Geometry helpers.
+    // Geometry helpers
     // ------------------------------------------------------------------
     private fun centroidOf(r: RectF) = PointF((r.left + r.right) / 2, (r.top + r.bottom) / 2)
     private fun areaOf(r: RectF) = (r.right - r.left) * (r.bottom - r.top)
@@ -1529,7 +1481,7 @@ class MotionTracker {
         return PointF(cc.x - pc.x, cc.y - pc.y)
     }
 
-    /** Normalized Euclidean distance between two centroids (0-1 scale). */
+    /** Normalised Euclidean distance between two centroids (0-1 scale). */
     private fun centroidDistance(a: PointF, b: PointF): Float {
         val dx = a.x - b.x
         val dy = a.y - b.y
@@ -1695,8 +1647,8 @@ class MotionTracker {
     }
 
     /**
-     * Backward-compatible overload for callers that still pass frame
-     * width/height in params 3 and 4.
+     * Backward-compatible overload retained for callers that still pass frame
+     * dimensions as the third and fourth parameters.
      */
     fun analyzeMotion(
         frameDetections: List<List<ObjectDetector.Detection>>,
@@ -1716,19 +1668,21 @@ class MotionTracker {
     }
 
     // ------------------------------------------------------------------
-    // Distance-aware motion fusion.
+    // Distance-aware motion fusion
     // ------------------------------------------------------------------
 
-     /**
-      * Fuse distance estimates into tracked detections, then optionally
-      * refine [MotionState] and compute [ThreatLevel].
-      *
-      * Call this after [analyzeMotion] and distance estimation.
-      *
-      * @param detections Output of [analyzeMotion]
-      * @param distances Distance results keyed by detection index
-      * @return New list with [distanceFeet]/[threatLevel], and maybe refined motion state.
-      */
+    /**
+     * Fuse distance estimates into tracked detections, producing
+     * distance-aware [MotionState] reclassification and a unified
+     * [ThreatLevel] for each detection.
+     *
+     * Call this **after** [analyzeMotion] and distance estimation.
+     *
+     * @param detections  Output of [analyzeMotion]
+     * @param distances   Distance results keyed by detection index
+     * @return New list with [distanceFeet] and [threatLevel] populated,
+     *         and [motionState] potentially refined based on proximity.
+     */
     fun fuseDistance(
         detections: List<TrackedDetection>,
         distances: Map<Int, DistanceEstimator.DistanceResult>
@@ -1762,7 +1716,7 @@ class MotionTracker {
                 withConfirmedRate++
             }
 
-            // Distance-aware motion reclassification.
+            // --- Distance-aware motion reclassification ---
             val decision = if (feet != null) {
                 refineMotionWithDistance(
                     state = det.motionState,
@@ -1824,15 +1778,15 @@ class MotionTracker {
         val awayStreak: Int
     )
 
-     /**
-      * Refine motion state using absolute distance + distance rate.
-      *
-      * Positive [closingRateFtPerSec] means distance is shrinking (approaching).
-      * Negative means distance is growing.
-      *
-      * Crossing states are preserved because distance-rate does not reliably
-      * encode left/right direction.
-      */
+    /**
+     * Refine the motion state using absolute distance plus distance rate.
+     *
+     * Positive [closingRateFtPerSec] means decreasing distance
+     * (object approaching). Negative means increasing distance.
+     *
+     * Crossing states are preserved here because distance-rate does not
+     * reliably encode lateral direction.
+     */
     private fun refineMotionWithDistance(
         state: MotionState,
         magnitude: Float,
@@ -1905,8 +1859,9 @@ class MotionTracker {
         }
 
         return when {
-            // Close range: only promote STATIONARY to APPROACHING with evidence.
-            // UNKNOWN stays UNKNOWN so uncertainty is not force-promoted.
+            // Close range: promote only STATIONARY to APPROACHING when
+            // there is positive motion evidence. UNKNOWN remains UNKNOWN
+            // so uncertain motion is not force-promoted.
             distanceFeet < CLOSE_RANGE_FT &&
             state == MotionState.STATIONARY &&
             magnitude > VELOCITY_THRESHOLD * CLOSE_RANGE_VEL_SCALE * REFERENCE_DT_S -> {
@@ -1917,7 +1872,8 @@ class MotionTracker {
                 )
             }
 
-            // Far range: demote weak APPROACHING to STATIONARY to cut false alarms.
+            // Far range: demote weak APPROACHING to STATIONARY — noise at
+            // distance shouldn't create false alarms.
             distanceFeet > MEDIUM_RANGE_FT &&
             state == MotionState.APPROACHING &&
             magnitude < VELOCITY_THRESHOLD * FAR_RANGE_VEL_SCALE * REFERENCE_DT_S -> {
@@ -1993,14 +1949,16 @@ class MotionTracker {
     }
 
     /**
-     * Compute [ThreatLevel] from (possibly refined) motion state + distance.
+     * Compute a [ThreatLevel] from the (possibly refined) motion state
+     * and distance.  This is the primary output for assistive threat
+     * prioritisation downstream.
      */
     private fun computeThreatLevel(
         state: MotionState,
         distanceFeet: Float?
     ): ThreatLevel {
         if (distanceFeet == null) {
-            // No distance data, so use motion-only fallback.
+            // No distance data — fall back to motion-only heuristic
             return when (state) {
                 MotionState.APPROACHING    -> ThreatLevel.HIGH
                 MotionState.CROSSING_LEFT,
@@ -2016,13 +1974,13 @@ class MotionTracker {
 
         return when (state) {
             MotionState.APPROACHING -> when {
-                isClose  -> ThreatLevel.CRITICAL   // approaching and very near
+                isClose  -> ThreatLevel.CRITICAL   // approaching fast, very near
                 isMedium -> ThreatLevel.HIGH       // approaching at mid-range
-                else     -> ThreatLevel.MODERATE   // approaching but farther away
+                else     -> ThreatLevel.MODERATE   // approaching but far away
             }
             MotionState.CROSSING_LEFT,
             MotionState.CROSSING_RIGHT -> when {
-                isClose  -> ThreatLevel.CRITICAL   // crossing path and very near
+                isClose  -> ThreatLevel.CRITICAL   // crossing path, very near
                 isMedium -> ThreatLevel.HIGH
                 else     -> ThreatLevel.MODERATE
             }
@@ -2031,7 +1989,7 @@ class MotionTracker {
                 else     -> ThreatLevel.LOW
             }
             MotionState.STATIONARY -> when {
-                isClose  -> ThreatLevel.MODERATE   // stationary but still close
+                isClose  -> ThreatLevel.MODERATE   // sitting still but in the way
                 else     -> ThreatLevel.LOW
             }
             MotionState.UNKNOWN -> when {
@@ -2041,7 +1999,7 @@ class MotionTracker {
         }
     }
 
-    // Convenience helper: convert raw Detection to TrackedDetection.
+    // Extension: convert a raw Detection to TrackedDetection
     private fun ObjectDetector.Detection.toTracked(
         state: MotionState,
         magnitude: Float

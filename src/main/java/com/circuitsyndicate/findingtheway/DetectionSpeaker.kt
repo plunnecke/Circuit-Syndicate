@@ -11,9 +11,9 @@ import android.util.Log
 import java.util.*
 
 /**
- * Speech helper for object detections.
- *
- * Kept the same priority flow used by the app:
+ * TTS demo. Will be replaced by mobile app class
+ * 
+ * Logic hierarchy will be retained 
  *
  * Priority order for speech:
  * 1. Moving + nearby objects (highest threat)
@@ -21,7 +21,6 @@ import java.util.*
  * 3. Moving far objects
  * 4. Stationary far objects
  *
- * This is intentionally behavior-preserving; only presentation details live here.
  */
 class DetectionSpeaker(context: Context) : TextToSpeech.OnInitListener {
 
@@ -33,7 +32,7 @@ class DetectionSpeaker(context: Context) : TextToSpeech.OnInitListener {
 
     companion object {
         private const val TAG = "DetectionSpeaker"
-        private const val MAX_SPOKEN_ITEMS = 7   // Keep lists short so speech stays digestible.
+        private const val MAX_SPOKEN_ITEMS = 7   // Cap speech at 7 items
         private const val SPEECH_RATE = 1.15f    
         private const val PITCH = 1.0f
 
@@ -80,7 +79,7 @@ class DetectionSpeaker(context: Context) : TextToSpeech.OnInitListener {
         }
     }
 
-    // Legacy contract kept so existing GlassesImagePipeline calls still work.
+    // Backward-compatible speech contract used by existing GlassesImagePipeline.
     enum class MotionState {
         APPROACHING,
         MOVING_AWAY,
@@ -171,8 +170,8 @@ class DetectionSpeaker(context: Context) : TextToSpeech.OnInitListener {
         telemetryListener = listener
     }
 
-    /** Legacy overload for callers that still send Detection payloads. */
-    fun speak(detections: List<Detection>, interruptInFlight: Boolean = false): String? {
+    /** Backward-compatible overload for legacy Detection payloads. */
+    fun speak(detections: List<Detection>): String? {
         val audioEnabled = AudioSettings.isAudioEnabled(appContext)
         val mode = AssistiveRuntimeSettings.getMode(appContext)
         if (!shouldAttemptDetectionSpeech(audioEnabled, mode)) {
@@ -202,20 +201,18 @@ class DetectionSpeaker(context: Context) : TextToSpeech.OnInitListener {
         val text = buildSpeechText(detections)
         Log.d(TAG, "Speaking: $text")
         val utteranceId = "detection_${System.currentTimeMillis()}"
-        speakWithPolicy(text, utteranceId, interruptInFlight)
+        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
         return utteranceId
     }
 
     /**
-        * Main overload for tracked detections + estimator output.
-        *
+     *
      * @param detections Tracked detections with motion state
      * @param distances Distance results indexed by detection position
      */
     fun speak(
         detections: List<MotionTracker.TrackedDetection>,
-        distances: Map<Int, DistanceEstimator.DistanceResult>,
-        interruptInFlight: Boolean = false
+        distances: Map<Int, DistanceEstimator.DistanceResult>
     ): String? {
         val audioEnabled = AudioSettings.isAudioEnabled(appContext)
         val mode = AssistiveRuntimeSettings.getMode(appContext)
@@ -247,24 +244,12 @@ class DetectionSpeaker(context: Context) : TextToSpeech.OnInitListener {
         Log.d(TAG, "Speaking: $text")
 
         val utteranceId = "detection_${System.currentTimeMillis()}"
-        speakWithPolicy(text, utteranceId, interruptInFlight)
+        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
         return utteranceId
     }
 
-    private fun speakWithPolicy(text: String, utteranceId: String, interruptInFlight: Boolean) {
-        if (interruptInFlight) {
-            tts?.stop()
-        }
-        val queueMode = if (interruptInFlight) {
-            TextToSpeech.QUEUE_FLUSH
-        } else {
-            TextToSpeech.QUEUE_ADD
-        }
-        tts?.speak(text, queueMode, null, utteranceId)
-    }
-
     /**
-     * Turn detections into a spoken sentence list, ordered by policy priority.
+     * Build prioritized natural language text from detections.
      */
     fun buildSpeechText(
         detections: List<MotionTracker.TrackedDetection>,
@@ -274,13 +259,15 @@ class DetectionSpeaker(context: Context) : TextToSpeech.OnInitListener {
             return "No objects detected."
         }
 
-        // Build sortable speech items.
-        // Lower numbers mean higher priority; urgent close-range items (<= 5 ft)
-        // get promoted ahead of non-urgent ones.
+        // Create speech items with priority scores
+        // Lower = higher priority. Urgent close-range items (<= 5 ft)
+        // are promoted ahead of all non-urgent items.
         data class SpeechItem(
             val label: String,
             val distanceCategory: String,
+            val distanceFeet: Float?,
             val motionState: MotionTracker.MotionState,
+            val urgent: Boolean,
             val priority: Int,
             val distanceTieBreak: Float,
             val sourceIndex: Int
@@ -290,8 +277,9 @@ class DetectionSpeaker(context: Context) : TextToSpeech.OnInitListener {
             val dist = distances[idx]
             val distFeet = dist?.distanceFeet
 
-            // Priority comes straight from the fused threat level.
-            // This keeps ordering consistent with classifier output.
+            // Use the fused threat level directly for priority ordering.
+            // This replaces the previous ad-hoc distance+motion heuristic
+            // and ensures the classification itself drives prioritisation.
             val basePriority = when (det.threatLevel) {
                 MotionTracker.ThreatLevel.CRITICAL -> 0
                 MotionTracker.ThreatLevel.HIGH     -> 1
@@ -300,15 +288,19 @@ class DetectionSpeaker(context: Context) : TextToSpeech.OnInitListener {
                 MotionTracker.ThreatLevel.UNKNOWN  -> 4
             }
 
-            // Prefer fused distance on the detection; fall back to estimator distance.
+            // Build spoken distance text: prefer the fused distanceFeet
+            // carried on the detection itself, fall back to estimator result.
             val feet = det.distanceFeet ?: distFeet
+            val urgent = SpeechPriorityPolicy.isUrgentDistance(feet)
             val spokenDist = SpeechPriorityPolicy.spokenDistancePhrase(feet, dist?.distanceCategory ?: "nearby")
             val ordering = SpeechPriorityPolicy.orderingKey(basePriority, feet)
 
             SpeechItem(
                 label = det.label,
                 distanceCategory = spokenDist,
+                distanceFeet = feet,
                 motionState = det.motionState,
+                urgent = urgent,
                 priority = ordering.effectivePriority,
                 distanceTieBreak = ordering.distanceTieBreak,
                 sourceIndex = idx
@@ -323,14 +315,17 @@ class DetectionSpeaker(context: Context) : TextToSpeech.OnInitListener {
         data class GroupKey(
             val label: String,
             val distCat: String,
-            val motion: MotionTracker.MotionState
+            val motion: MotionTracker.MotionState,
+            val urgent: Boolean
         )
 
         val groups = items.groupBy {
-            GroupKey(it.label, it.distanceCategory, it.motionState)
+            GroupKey(it.label, it.distanceCategory, it.motionState, it.urgent)
         }
 
-        val phraseRecords = mutableListOf<String>()
+        data class PhraseRecord(val text: String, val urgent: Boolean)
+
+        val phraseRecords = mutableListOf<PhraseRecord>()
 
         for ((key, group) in groups) {
             if (phraseRecords.size >= MAX_SPOKEN_ITEMS) break
@@ -348,14 +343,23 @@ class DetectionSpeaker(context: Context) : TextToSpeech.OnInitListener {
                 MotionTracker.MotionState.MOVING_AWAY -> "moving away"
                 MotionTracker.MotionState.CROSSING_LEFT -> "moving to your left"
                 MotionTracker.MotionState.CROSSING_RIGHT -> "moving to your right"
-                MotionTracker.MotionState.STATIONARY -> "stationary"
                 MotionTracker.MotionState.UNKNOWN -> "with unclear motion"
+                else -> ""
             }
 
-            phraseRecords.add("$noun $motionPhrase, ${key.distCat}")
+            val phrase = if (motionPhrase.isNotEmpty()) {
+                "$noun $motionPhrase, ${key.distCat}"
+            } else {
+                "$noun ${key.distCat}"
+            }
+
+            phraseRecords.add(PhraseRecord(phrase, key.urgent))
         }
 
-        return composeSpeech(phraseRecords)
+        val urgentPhrases = phraseRecords.filter { it.urgent }.map { it.text }
+        val normalPhrases = phraseRecords.filterNot { it.urgent }.map { it.text }
+
+        return composeSpeech(urgentPhrases, normalPhrases)
     }
 
     private fun buildSpeechText(detections: List<Detection>): String {
@@ -363,7 +367,9 @@ class DetectionSpeaker(context: Context) : TextToSpeech.OnInitListener {
 
         data class LegacySpeechItem(
             val phrase: String,
+            val urgent: Boolean,
             val priority: Int,
+            val distanceFeet: Float?,
             val distanceTieBreak: Float,
             val sourceIndex: Int
         )
@@ -377,26 +383,32 @@ class DetectionSpeaker(context: Context) : TextToSpeech.OnInitListener {
                 ThreatLevel.UNKNOWN -> 4
             }
 
+            val urgent = SpeechPriorityPolicy.isUrgentDistance(det.distanceFeet)
             val ordering = SpeechPriorityPolicy.orderingKey(basePriority, det.distanceFeet)
 
             val spokenLabel = det.label.lowercase(Locale.US)
             val noun = articleFor(spokenLabel)
-            val distanceText = SpeechPriorityPolicy.spokenDistancePhrase(det.distanceFeet, det.distanceCategory)
-
             val motionPhrase = when (det.motionState) {
                 MotionState.APPROACHING -> "approaching"
                 MotionState.MOVING_AWAY -> "moving away"
                 MotionState.CROSSING_LEFT -> "moving to your left"
                 MotionState.CROSSING_RIGHT -> "moving to your right"
-                MotionState.STATIONARY -> "stationary"
+                MotionState.STATIONARY -> ""
                 MotionState.UNKNOWN -> "with unclear motion"
             }
+            val distanceText = SpeechPriorityPolicy.spokenDistancePhrase(det.distanceFeet, det.distanceCategory)
 
-            val phrase = "$noun $motionPhrase, $distanceText"
+            val phrase = if (motionPhrase.isNotEmpty()) {
+                "$noun $motionPhrase, $distanceText"
+            } else {
+                "$noun $distanceText"
+            }
 
             LegacySpeechItem(
                 phrase = phrase,
+                urgent = urgent,
                 priority = ordering.effectivePriority,
+                distanceFeet = det.distanceFeet,
                 distanceTieBreak = ordering.distanceTieBreak,
                 sourceIndex = idx
             )
@@ -406,24 +418,46 @@ class DetectionSpeaker(context: Context) : TextToSpeech.OnInitListener {
                 .thenBy { it.sourceIndex }
         )
 
-        return composeSpeech(ordered.take(MAX_SPOKEN_ITEMS).map { it.phrase })
-    }
+        val urgentPhrases = ordered.filter { it.urgent }
+            .take(MAX_SPOKEN_ITEMS)
+            .map { it.phrase }
 
-    private fun composeSpeech(phrases: List<String>): String {
-        return formatPhraseList(phrases.take(MAX_SPOKEN_ITEMS))
-    }
-
-    private fun formatPhraseList(phrases: List<String>): String {
-        if (phrases.isEmpty()) return "No objects detected."
-        return if (phrases.size == 1) {
-            "${phrases[0]}."
+        val remainingSlots = (MAX_SPOKEN_ITEMS - urgentPhrases.size).coerceAtLeast(0)
+        val normalPhrases = if (remainingSlots > 0) {
+            ordered.filterNot { it.urgent }
+                .take(remainingSlots)
+                .map { it.phrase }
         } else {
-            val allButLast = phrases.dropLast(1).joinToString(", ")
-            "$allButLast, and ${phrases.last()}."
+            emptyList()
+        }
+
+        return composeSpeech(urgentPhrases, normalPhrases)
+    }
+
+    private fun composeSpeech(urgentPhrases: List<String>, normalPhrases: List<String>): String {
+        return if (urgentPhrases.isNotEmpty()) {
+            val urgentSentence = formatPhraseList(urgentPhrases, "Warning:")
+            if (normalPhrases.isNotEmpty()) {
+                "$urgentSentence ${formatPhraseList(normalPhrases, "I also see")}".trim()
+            } else {
+                urgentSentence
+            }
+        } else {
+            formatPhraseList(normalPhrases, "I see")
         }
     }
 
-    // Basic article helper for speech grammar.
+    private fun formatPhraseList(phrases: List<String>, intro: String): String {
+        if (phrases.isEmpty()) return "No objects detected."
+        return if (phrases.size == 1) {
+            "$intro ${phrases[0]}."
+        } else {
+            val allButLast = phrases.dropLast(1).joinToString(", ")
+            "$intro $allButLast, and ${phrases.last()}."
+        }
+    }
+
+    // Grammar correction
     private fun articleFor(noun: String): String {
         val vowels = "aeiou"
         val article = if (noun.isNotEmpty() && noun[0].lowercaseChar() in vowels) "an" else "a"

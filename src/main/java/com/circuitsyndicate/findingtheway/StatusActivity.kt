@@ -138,7 +138,7 @@ class StatusActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         btnTakeBurst.setOnClickListener {
             tapActionConfirmation.confirmOrAnnounce(
                 key = "status:take_burst",
-                announcement = "Start burst capture with smart glasses. Tap again to confirm.",
+                announcement = "Interrupt current photo operations and start burst capture. Tap again to confirm.",
                 interruptSpeech = ::interruptSpeech,
                 speak = ::speak,
                 onConfirmed = ::performTakeBurst
@@ -182,7 +182,7 @@ class StatusActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         tapActionConfirmation.clear()
         if (GlassesCommandSender.isConnected()) {
             if (GlassesCommandSender.takeBurst(interruptInFlight = true)) {
-                speak("Burst capture started.")
+                speak("Burst capture started. Previous photo operations were interrupted.")
             } else {
                 if (!GlassesCommandSender.isCaptureEnabled()) {
                     speak("Picture taking and inference are disabled in settings.")

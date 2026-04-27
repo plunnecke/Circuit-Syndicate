@@ -1,23 +1,18 @@
 package com.circuitsyndicate.findingtheway
 
 /**
- * Little command hub for talking to the glasses ESP32-CAM over BLE.
- * Everything routes through GlassesBleManager, which owns the active GATT link.
+ * Typed API for sending commands to the glasses ESP32-CAM via BLE.
+ * All calls route through GlassesBleManager which holds the GATT connection.
  */
 object GlassesCommandSender {
 
-    // Burst cadence policy tuning knobs.
-    private const val MOTION_PRIORITY_BURST_FRAMES = 4L
-    private const val MOTION_PRIORITY_BURST_SPAN_MS = 2000L
-    private const val POLICY_DELAY_MIN_MS =
-        (MOTION_PRIORITY_BURST_SPAN_MS + (MOTION_PRIORITY_BURST_FRAMES - 2L)) /
-            (MOTION_PRIORITY_BURST_FRAMES - 1L)
-    private const val POLICY_DELAY_MAX_MS = 1200L
-    private const val POLICY_MAX_STEP_MS = 80L
+    private const val POLICY_DELAY_MIN_MS = 20L
+    private const val POLICY_DELAY_MAX_MS = 300L
+    private const val POLICY_MAX_STEP_MS = 10L
     private const val POLICY_COOLDOWN_MS = 2_000L
-    private const val POLICY_REJECTED_BUMP_MS = 80L
-    private const val POLICY_CLAMPED_BUMP_MS = 40L
-    private const val POLICY_MISSING_ACK_BUMP_MS = 40L
+    private const val POLICY_REJECTED_BUMP_MS = 10L
+    private const val POLICY_CLAMPED_BUMP_MS = 5L
+    private const val POLICY_MISSING_ACK_BUMP_MS = 5L
 
     enum class BurstCadencePolicyReason {
         BASELINE,
@@ -54,23 +49,14 @@ object GlassesCommandSender {
         return false
     }
 
-    /** Ask for one photo + object detection pass. */
-    fun takePhoto(interruptInFlight: Boolean = false): Boolean {
-        val commandName = if (interruptInFlight) {
-            "CMD_SINGLE_PHOTO_RESTART"
-        } else {
-            "CMD_SINGLE_PHOTO"
-        }
-        if (!canSendCaptureCommand(commandName)) return false
-        InteractionLogger.logCommand(commandName, "APP→GLASSES")
-        return if (interruptInFlight) {
-            GlassesBleManager.interruptAndTakePhoto()
-        } else {
-            GlassesBleManager.takePhoto()
-        }
+    /** Request a single photo + object detection. */
+    fun takePhoto(): Boolean {
+        if (!canSendCaptureCommand("CMD_SINGLE_PHOTO")) return false
+        InteractionLogger.logCommand("CMD_SINGLE_PHOTO", "APP→GLASSES")
+        return GlassesBleManager.takePhoto()
     }
 
-    /** Ask for burst capture + motion-aware object detection. */
+    /** Request burst capture + motion-aware object detection. */
     fun takeBurst(interruptInFlight: Boolean = false): Boolean {
         val commandName = if (interruptInFlight) {
             "CMD_BURST_RESTART"
@@ -112,7 +98,7 @@ object GlassesCommandSender {
     }
 
     /**
-     * Returns the newest rolling cadence hint for firmware (if we have enough data).
+     * Latest rolling cadence recommendation to hand off to firmware, if available.
      */
     fun getBurstCadenceHandoff(): BurstCadenceHandoff? {
         val aggregate = runCatching {
@@ -226,28 +212,16 @@ object GlassesCommandSender {
         lastPolicyState = null
     }
 
-    /** Sends a raw BLE payload to the glasses control characteristic. */
+    /** Send a raw BLE payload to the glasses control characteristic. */
     fun sendPayload(payload: ByteArray): Boolean {
         if (payload.isEmpty()) return false
         InteractionLogger.logCommand("CMD_PAYLOAD_${payload.size}B", "APP→GLASSES")
         return GlassesBleManager.writePayload(payload)
     }
 
-    /** True when the glasses BLE link is currently connected. */
+    /** Check whether the glasses BLE link is live. */
     fun isConnected(): Boolean = GlassesBleManager.isConnected()
 
-    /** True when capture/inference commands are currently allowed. */
+    /** Check whether capture/inference commands are currently allowed. */
     fun isCaptureEnabled(): Boolean = GlassesBleManager.isCaptureEnabled()
-
-    /**
-     * True when capture is enabled, glasses are connected, and recent command/data
-     * activity suggests picture-taking is actively running.
-     */
-    fun isCaptureActivelyStreaming(maxSilenceMs: Long = 15_000L): Boolean {
-        return GlassesBleManager.isCaptureActivelyStreaming(maxSilenceMs)
-    }
-
-    fun isCapturePipelineBusy(): Boolean {
-        return GlassesBleManager.isCapturePipelineBusy()
-    }
 }

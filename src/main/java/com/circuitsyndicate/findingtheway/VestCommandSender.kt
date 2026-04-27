@@ -23,10 +23,6 @@ package com.circuitsyndicate.findingtheway
  */
 object VestCommandSender {
 
-    private const val INTER_COMMAND_DELAY_MS = 180L
-    private const val RETRY_DELAY_MS = 220L
-    private const val MAX_SEND_ATTEMPTS = 2
-
     // ── Haptics ───────────────────────────────────────────────────────────────
     fun sendHapticsOn()  = send("TURN HAPTICS ON")
     fun sendHapticsOff() = send("TURN HAPTICS OFF")
@@ -39,25 +35,8 @@ object VestCommandSender {
     /** Turns everything off. */
     fun sendAllOff()     = send("TURN ALL OFF")
 
-    /**
-     * Turns system on with a compatibility-first sequence.
-     *
-     * 1) Clear any firmware-side system lock.
-     * 2) Enable each subsystem explicitly.
-     *
-     * Some deployed vest builds reject TURN ALL ON, so we avoid using it as the
-     * primary path.
-     */
-    fun sendAllOn(): Boolean {
-        sendWithRetry("TURN SYSTEM ON")
-        Thread.sleep(INTER_COMMAND_DELAY_MS)
-
-        val hapticsSent = sendWithRetry("TURN HAPTICS ON")
-        Thread.sleep(INTER_COMMAND_DELAY_MS)
-
-        val sensorsSent = sendWithRetry("TURN SENSORS ON")
-        return hapticsSent && sensorsSent
-    }
+    /** Turns everything on in a single vest-side state update. */
+    fun sendAllOn() = send("TURN ALL ON")
 
     // ── Safety check responses ────────────────────────────────────────────────
     // Firmware does msg.toLowerCase() then checks == "glasses are on" / "glasses are off"
@@ -71,17 +50,5 @@ object VestCommandSender {
     private fun send(command: String): Boolean {
         InteractionLogger.logCommand(command, "APP→VEST")
         return DeviceManager.sendToVest(command)
-    }
-
-    private fun sendWithRetry(command: String): Boolean {
-        repeat(MAX_SEND_ATTEMPTS) { attempt ->
-            if (send(command)) {
-                return true
-            }
-            if (attempt < MAX_SEND_ATTEMPTS - 1) {
-                Thread.sleep(RETRY_DELAY_MS)
-            }
-        }
-        return false
     }
 }

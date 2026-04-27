@@ -27,21 +27,19 @@ import java.util.Locale
 import kotlin.math.roundToLong
 
 /**
- * This class is basically the phone-side pipeline for images coming from the
- * glasses over BLE.
+ * Handles the full glasses inference pipeline on the Android phone side:
  *
- * Main flow (in order):
- *   1. Rebuild JPEG data from BLE chunks (single photo or burst)
+ *   1. Reassemble JPEG from BLE binary chunks (single photo or burst)
  *   2. Validate JPEG header/trailer
  *   3. Save raw frames to Pictures/FindingTheWay/
- *   4. Run YOLO object detection through ObjectDetector
- *   5. Run distance estimation through DistanceEstimator
- *   6. Run motion tracking through MotionTracker
- *   7. Annotate and save the result image
- *   8. Speak detections through DetectionSpeaker
+ *   4. Run YOLO object detection   → ObjectDetector
+ *   5. Run distance estimation     → DistanceEstimator
+ *   6. Run motion tracking         → MotionTracker
+ *   7. Annotate and save result image
+ *   8. Speak detections            → DetectionSpeaker
  *   9. Broadcast OBJECT_DETECTED + GLASSES_IMAGE_SAVED
  *
- * BLE chunk protocol from ESP32-CAM notifications:
+ * Binary chunk protocol (from ESP32-CAM via BLE notifications):
  *
  *   Single photo:
  *     Chunk 0:  [frameIdx_lo, frameIdx_hi, orientation, ...jpeg_bytes]
@@ -56,7 +54,7 @@ import kotlin.math.roundToLong
  *     Frame end:[0xFF, 0xFF, burstSeq]   (3 bytes)
  *     Burst end:[0xFE, 0xFF]             (2 bytes)
  *
- * Commands sent to the ESP32-CAM over BLE GATT writes:
+ * Commands sent TO the ESP32-CAM via BLE GATT write:
  *   CMD_SINGLE_PHOTO = 0x01
  *   CMD_BURST        = 0x04
  *   CMD_BURST_CADENCE_HINT = 0x05  (optional follow-up hint payload)
@@ -76,70 +74,29 @@ class GlassesImagePipeline(private val context: Context) {
         const val ACTION_BURST_CADENCE_HANDOFF_UPDATED = "BURST_CADENCE_HANDOFF_UPDATED"
 
         private const val CAPTURE_DISABLE_STALE_FLUSH_MS = 5 * 60 * 1000L
-        private const val CAPTURE_ACTIVITY_RECENT_WINDOW_MS = 15_000L
-        private const val CAPTURE_CYCLE_NO_DATA_TIMEOUT_MS = 12_000L
-        private const val CAPTURE_CYCLE_TRANSFER_IDLE_TIMEOUT_MS = 8_000L
-        private const val CAPTURE_CYCLE_INFERENCE_TIMEOUT_MS = 45_000L
-        private const val SINGLE_MODE_BURST_MISMATCH_COOLDOWN_MS = 750L
 
         private const val BURST_TIMING_ROLLING_WINDOW = 20
         private const val CADENCE_MODERATE_SPREAD_MS = 60L
         private const val CADENCE_DEGRADED_SPREAD_MS = 120L
-        // Motion-priority cadence is intentionally spread over ~2s across burst frames,
-        // so total latency thresholds are wider to avoid false DEGRADED flags.
-        private const val CADENCE_MODERATE_TOTAL_LATENCY_MS = 5000L
-        private const val CADENCE_DEGRADED_TOTAL_LATENCY_MS = 8000L
+        private const val CADENCE_MODERATE_TOTAL_LATENCY_MS = 1200L
+        private const val CADENCE_DEGRADED_TOTAL_LATENCY_MS = 2500L
         private const val CADENCE_DEGRADED_DROP_PER_FRAME = 0.20
         private const val RECOMMEND_DELAY_MODERATE_BUMP_MS = 10L
         private const val RECOMMEND_DELAY_DEGRADED_BUMP_MS = 20L
-        private const val MOTION_PRIORITY_BURST_FRAMES = 4L
-        private const val MOTION_PRIORITY_BURST_SPAN_MS = 2000L
-        private const val RECOMMEND_DELAY_MIN_MS =
-            (MOTION_PRIORITY_BURST_SPAN_MS + (MOTION_PRIORITY_BURST_FRAMES - 2L)) /
-                (MOTION_PRIORITY_BURST_FRAMES - 1L)
-        private const val RECOMMEND_DELAY_MAX_MS = 1200L
-        private const val DETECTOR_MODEL_SWAP_COOLDOWN_MS = 20_000L
-        private const val DETECTOR_BURST_DOWNSHIFT_THRESHOLD_MS = 1_800L
-        private const val DETECTOR_UPSHIFT_SIGNIFICANT_DELAY_MS = 450L
-        private const val DETECTOR_IDLE_UPSHIFT_DELAY_MS = 7_000L
-        private const val DETECTOR_IDLE_UPSHIFT_POLL_MS = 250L
+        private const val RECOMMEND_DELAY_MIN_MS = 20L
+        private const val RECOMMEND_DELAY_MAX_MS = 300L
         private const val CADENCE_ACK_MARKER_LO: Byte = 0xFD.toByte()
         private const val CADENCE_ACK_MARKER_HI: Byte = 0xFF.toByte()
         private const val CADENCE_ACK_VERSION = 0x01
         private const val CADENCE_ACK_APPLIED = 0x00
         private const val CADENCE_ACK_CLAMPED = 0x01
         private const val CADENCE_ACK_REJECTED = 0x02
-        private const val TRANSFER_ABORT_MARKER_LO: Byte = 0xFC.toByte()
-        private const val TRANSFER_ABORT_MARKER_HI: Byte = 0xFF.toByte()
-        private const val TRANSFER_ABORT_REASON_UNKNOWN = 0x00
-        private const val TRANSFER_ABORT_REASON_CMD_SINGLE = 0x01
-        private const val TRANSFER_ABORT_REASON_CMD_BURST = 0x02
-        private const val TRANSFER_ABORT_REASON_CAPTURE_DISABLED = 0x03
-        private const val TRANSFER_ABORT_REASON_BUTTON_PRIORITY = 0x04
-        private const val TRANSFER_ABORT_REASON_RUNTIME_GUARD = 0x05
-        private const val DETECTOR_MODEL_SINGLE_TOP = "yolov8m-oiv7.onnx"
-        private const val DETECTOR_MODEL_BURST_TOP = "yolov8m-oiv7.onnx"
-        private val DETECTOR_MODEL_SINGLE_DOWNSHIFT_PATH = listOf(
-            DETECTOR_MODEL_SINGLE_TOP,
-            "yolov8s-oiv7.onnx",
-            "yolov8n-oiv7.onnx"
-        )
-        private val DETECTOR_MODEL_BURST_DOWNSHIFT_PATH = listOf(
-            DETECTOR_MODEL_BURST_TOP,
-            "yolov8s-oiv7.onnx",
-            "yolov8n-oiv7.onnx"
-        )
     }
 
     enum class BurstCadenceHealth {
         STABLE,
         MODERATE,
         DEGRADED
-    }
-
-    private enum class InferenceProfile {
-        SINGLE,
-        BURST
     }
 
     data class BurstTimingStats(
@@ -187,7 +144,6 @@ class GlassesImagePipeline(private val context: Context) {
         val startedWallMs: Long,
         var commandDispatchedElapsedMs: Long? = null,
         var firstDataElapsedMs: Long? = null,
-        var lastDataElapsedMs: Long? = null,
         var transferCompletedElapsedMs: Long? = null,
         var inferenceStartedElapsedMs: Long? = null,
         var inferenceCompletedElapsedMs: Long? = null,
@@ -196,14 +152,8 @@ class GlassesImagePipeline(private val context: Context) {
         var ttsCompletedElapsedMs: Long? = null
     )
 
-    private data class CaptureCycleTimeoutDecision(
-        val reason: String,
-        val idleMs: Long,
-        val thresholdMs: Long
-    )
-
-    // ── Inference stack (initialized once, async) ────────────────────────────
-    // This path is ONNX-only in the migrated app.
+    // ── Inference components (initialised once asynchronously) ────────────────
+    // Inference is ONNX-only in the migrated app path.
 
     @Volatile var objectDetector: ObjectDetector? = null
     @Volatile var distanceEstimator: DistanceEstimator? = null
@@ -218,7 +168,7 @@ class GlassesImagePipeline(private val context: Context) {
     private val imageStorage = ImageStorageManager.getInstance(context)
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
-    // ── Mode + capture state ─────────────────────────────────────────────────
+    // ── Mode state ────────────────────────────────────────────────────────────
 
     var isBurstMode = false
         private set
@@ -228,11 +178,9 @@ class GlassesImagePipeline(private val context: Context) {
     @Volatile private var captureGateDisabledAtMs: Long? = null
     @Volatile private var captureGateEpoch: Long = 0L
     @Volatile private var captureGateStaleFlushed = false
-    @Volatile private var processingInFlight = false
-    @Volatile private var processingPreemptLatch = false
     private var captureGateFlushJob: Job? = null
 
-    // ── Single-photo reassembly state ────────────────────────────────────────
+    // ── Single photo reassembly ───────────────────────────────────────────────
 
     private val photoBuffer = ByteArrayOutputStream()
     private var expectedChunkIndex = 0
@@ -241,7 +189,7 @@ class GlassesImagePipeline(private val context: Context) {
     private var totalBytesReceived = 0
     private var droppedChunks = 0
 
-    // ── Burst reassembly state ───────────────────────────────────────────────
+    // ── Burst reassembly ──────────────────────────────────────────────────────
 
     private val burstFrameBuffers = mutableMapOf<Int, ByteArrayOutputStream>()
     private val burstFrameTimestamps = mutableMapOf<Int, Long>()
@@ -249,8 +197,6 @@ class GlassesImagePipeline(private val context: Context) {
     private var currentBurstSeq = -1
     private var burstExpectedChunkIndex = 0
     private var burstDroppedChunks = 0
-    @Volatile private var burstReassemblyPinnedForPostProcess = false
-    @Volatile private var lastSingleModeBurstMismatchElapsedMs: Long = 0L
     @Volatile private var burstRequestStartedAtMs: Long = 0L
     @Volatile private var burstFirstFrameAtMs: Long? = null
     @Volatile private var lastBurstTimingStats: BurstTimingStats? = null
@@ -258,21 +204,13 @@ class GlassesImagePipeline(private val context: Context) {
     private val burstTimingAggregateLock = Any()
     @Volatile private var lastBurstTimingAggregateStats: BurstTimingAggregateStats? = null
     @Volatile private var lastBurstCadenceHandoffFeedback: BurstCadenceHandoffFeedback? = null
-    @Volatile private var detectorModelAutoSwapEnabled = false
-    @Volatile private var detectorUpshiftPerInferenceEnabled = false
-    @Volatile private var lastDetectorModelSwapAtMs: Long = 0L
-    @Volatile private var lastCaptureCommandElapsedMs: Long = 0L
-    @Volatile private var lastInferenceImageDataElapsedMs: Long = 0L
-    @Volatile private var lastInferenceProfile: InferenceProfile = InferenceProfile.SINGLE
-    private var detectorIdleUpshiftJob: Job? = null
-    private val detectorModelSwapLock = Any()
 
     private val captureCycleLock = Any()
     private var captureCycleCounter = 0L
     private var activeCaptureCycle: CaptureCycleTiming? = null
     private val utteranceToCycleId = mutableMapOf<String, Long>()
 
-    // ── Init/setup ────────────────────────────────────────────────────────────
+    // ── Init ──────────────────────────────────────────────────────────────────
 
     init {
         speaker.setTelemetryListener(object : DetectionSpeaker.TelemetryListener {
@@ -302,8 +240,8 @@ class GlassesImagePipeline(private val context: Context) {
                     TAG,
                     "Inference pipeline ready (detector requested=$detectorBackendPreference, active=${objectDetector?.getActiveBackend()})"
                 )
-            } catch (e: Throwable) {
-                Log.e(TAG, "Inference pipeline init failed: ${e.message}", e)
+            } catch (e: Exception) {
+                Log.e(TAG, "Inference pipeline init failed: ${e.message}")
             }
         }
     }
@@ -329,21 +267,7 @@ class GlassesImagePipeline(private val context: Context) {
         }
     }
 
-    fun isDetectorModelAutoSwapEnabled(): Boolean = detectorModelAutoSwapEnabled
-
-    fun setDetectorModelAutoSwapEnabled(enabled: Boolean) {
-        detectorModelAutoSwapEnabled = enabled
-        if (enabled) {
-            // Keep the policy simple: avoid upshift churn around every inference.
-            detectorUpshiftPerInferenceEnabled = false
-            scheduleDetectorIdleUpshiftCheck(lastInferenceProfile)
-        } else {
-            detectorIdleUpshiftJob?.cancel()
-            detectorIdleUpshiftJob = null
-        }
-    }
-
-    /** Update preferred backend and reconfigure the detector. */
+    /** Apply backend preference and reconfigure the detector. */
     fun setDetectorBackend(
         backend: ObjectDetector.Backend,
         onApplied: ((requested: ObjectDetector.Backend, active: ObjectDetector.Backend) -> Unit)? = null
@@ -372,8 +296,8 @@ class GlassesImagePipeline(private val context: Context) {
                     onApplied?.invoke(requestedBackend, active)
                     broadcastDetectorBackendChanged(requestedBackend, active)
                 }
-            } catch (e: Throwable) {
-                Log.e(TAG, "Failed to configure detector backend $requestedBackend: ${e.message}", e)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to configure detector backend $requestedBackend: ${e.message}")
                 val active = getActiveDetectorBackend()
 
                 withContext(Dispatchers.Main) {
@@ -399,37 +323,32 @@ class GlassesImagePipeline(private val context: Context) {
     // ── Command helpers ───────────────────────────────────────────────────────
 
     fun prepareSinglePhoto() {
-        // Keep burst buffers around until cycle completion so burst inference/TTS
-        // does not get interrupted by rapid command changes.
         isBurstMode = false
-        lastInferenceProfile = InferenceProfile.SINGLE
-        clearSingleReassemblyState()
+        photoBuffer.reset()
+        isReceiving = false
+        expectedChunkIndex = 0
+        totalBytesReceived = 0
+        droppedChunks = 0
     }
 
     fun prepareBurst() {
         isBurstMode = true
-        lastInferenceProfile = InferenceProfile.BURST
-        clearBurstReassemblyState()
+        burstFrameBuffers.clear()
+        burstFrameTimestamps.clear()
+        burstFrameCaptureTimeHints.clear()
+        currentBurstSeq = -1
+        burstExpectedChunkIndex = 0
+        burstDroppedChunks = 0
         burstRequestStartedAtMs = System.currentTimeMillis()
         burstFirstFrameAtMs = null
-        clearSingleReassemblyState()
+        isReceiving = false
+        totalBytesReceived = 0
     }
 
-    fun beginCaptureCycle(mode: String, trigger: String, allowSupersede: Boolean = false): Boolean {
+    fun beginCaptureCycle(mode: String, trigger: String) {
         val nowElapsed = SystemClock.elapsedRealtime()
         synchronized(captureCycleLock) {
-            expireStaleActiveCycleLocked(nowElapsed)
             activeCaptureCycle?.let { prior ->
-                val supersedeBlocked = shouldBlockCycleSupersedeLocked(prior)
-                val burstPriorityLock = burstReassemblyPinnedForPostProcess
-                if (supersedeBlocked && (!allowSupersede || burstPriorityLock)) {
-                    InteractionLogger.logSessionEvidence(
-                        "GLASSES_CYCLE",
-                        "CYCLE_START_BLOCKED",
-                        "mode=$mode;trigger=$trigger;active_id=${prior.id};active_mode=${prior.mode};active_trigger=${prior.trigger};reason=${if (burstPriorityLock) "BURST_POSTPROCESS_PRIORITY" else "ACTIVE_PIPELINE"}"
-                    )
-                    return false
-                }
                 completeCycleLocked(prior, "SUPERSEDED_BY_NEW_COMMAND", nowElapsed)
             }
 
@@ -446,26 +365,13 @@ class GlassesImagePipeline(private val context: Context) {
                 "CYCLE_START",
                 "id=${cycle.id};mode=${cycle.mode};trigger=${cycle.trigger};start_wall_ms=${cycle.startedWallMs}"
             )
-            return true
         }
-    }
-
-    private fun shouldBlockCycleSupersedeLocked(cycle: CaptureCycleTiming): Boolean {
-        if (burstReassemblyPinnedForPostProcess) return true
-        if (processingInFlight) return true
-        if (cycle.transferCompletedElapsedMs == null) return true
-        if (cycle.inferenceCompletedElapsedMs == null) return true
-        return false
     }
 
     fun markCaptureCommandDispatch(command: Byte, sent: Boolean) {
         val nowElapsed = SystemClock.elapsedRealtime()
         synchronized(captureCycleLock) {
             val cycle = activeCaptureCycle ?: return
-
-            if (sent) {
-                lastCaptureCommandElapsedMs = nowElapsed
-            }
 
             if (cycle.commandDispatchedElapsedMs == null) {
                 cycle.commandDispatchedElapsedMs = nowElapsed
@@ -495,11 +401,10 @@ class GlassesImagePipeline(private val context: Context) {
         }
     }
 
-    private fun markCycleDataReceived() {
+    private fun markCycleFirstDataIfNeeded() {
         val nowElapsed = SystemClock.elapsedRealtime()
         synchronized(captureCycleLock) {
             val cycle = activeCaptureCycle ?: return
-            cycle.lastDataElapsedMs = nowElapsed
             if (cycle.firstDataElapsedMs != null) return
 
             cycle.firstDataElapsedMs = nowElapsed
@@ -514,68 +419,6 @@ class GlassesImagePipeline(private val context: Context) {
                 "id=${cycle.id};mode=${cycle.mode};stage=CAPTURE;duration_ms=$captureMs"
             )
         }
-    }
-
-    private fun timeoutDecisionForActiveCycleLocked(
-        cycle: CaptureCycleTiming,
-        nowElapsed: Long
-    ): CaptureCycleTimeoutDecision? {
-        if (cycle.firstDataElapsedMs == null) {
-            val anchorElapsed = cycle.commandDispatchedElapsedMs ?: cycle.startedElapsedMs
-            val idleMs = (nowElapsed - anchorElapsed).coerceAtLeast(0L)
-            if (idleMs >= CAPTURE_CYCLE_NO_DATA_TIMEOUT_MS) {
-                return CaptureCycleTimeoutDecision(
-                    reason = "TIMEOUT_WAITING_FOR_CAPTURE_DATA",
-                    idleMs = idleMs,
-                    thresholdMs = CAPTURE_CYCLE_NO_DATA_TIMEOUT_MS
-                )
-            }
-            return null
-        }
-
-        if (cycle.transferCompletedElapsedMs == null) {
-            val anchorElapsed = cycle.lastDataElapsedMs ?: cycle.firstDataElapsedMs!!
-            val idleMs = (nowElapsed - anchorElapsed).coerceAtLeast(0L)
-            if (idleMs >= CAPTURE_CYCLE_TRANSFER_IDLE_TIMEOUT_MS) {
-                return CaptureCycleTimeoutDecision(
-                    reason = "TIMEOUT_WAITING_FOR_TRANSFER_END",
-                    idleMs = idleMs,
-                    thresholdMs = CAPTURE_CYCLE_TRANSFER_IDLE_TIMEOUT_MS
-                )
-            }
-            return null
-        }
-
-        if (cycle.inferenceCompletedElapsedMs == null) {
-            val anchorElapsed = cycle.inferenceStartedElapsedMs ?: cycle.transferCompletedElapsedMs!!
-            val idleMs = (nowElapsed - anchorElapsed).coerceAtLeast(0L)
-            if (idleMs >= CAPTURE_CYCLE_INFERENCE_TIMEOUT_MS) {
-                return CaptureCycleTimeoutDecision(
-                    reason = "TIMEOUT_WAITING_FOR_INFERENCE_DONE",
-                    idleMs = idleMs,
-                    thresholdMs = CAPTURE_CYCLE_INFERENCE_TIMEOUT_MS
-                )
-            }
-        }
-
-        return null
-    }
-
-    private fun expireStaleActiveCycleLocked(nowElapsed: Long): Boolean {
-        val cycle = activeCaptureCycle ?: return false
-        val timeout = timeoutDecisionForActiveCycleLocked(cycle, nowElapsed) ?: return false
-
-        InteractionLogger.logSessionEvidence(
-            "GLASSES_CYCLE",
-            "CYCLE_TIMEOUT",
-            "id=${cycle.id};mode=${cycle.mode};reason=${timeout.reason};idle_ms=${timeout.idleMs};threshold_ms=${timeout.thresholdMs}"
-        )
-
-        clearSingleReassemblyState()
-        clearBurstReassemblyState(reason = "cycle_timeout:${timeout.reason}")
-        isBurstMode = false
-        completeCycleLocked(cycle, timeout.reason, nowElapsed)
-        return true
     }
 
     private fun markCycleTransferCompleted(stageLabel: String, frames: Int? = null, dropped: Int? = null) {
@@ -747,15 +590,10 @@ class GlassesImagePipeline(private val context: Context) {
 
         utteranceToCycleId.entries.removeAll { it.value == cycle.id }
         activeCaptureCycle = null
-
-        if (burstReassemblyPinnedForPostProcess) {
-            clearBurstReassemblyState(reason = "cycle_complete:$reason")
-        }
     }
 
     fun setCaptureGateEnabled(enabled: Boolean, source: String = "APP") {
         var shouldStopSpeaker = false
-        var shouldCompleteActiveCycle = false
         synchronized(captureGateLock) {
             if (captureGateEnabled == enabled) return
 
@@ -773,7 +611,6 @@ class GlassesImagePipeline(private val context: Context) {
                 captureGateDisabledAtMs = disabledAtMs
                 captureGateStaleFlushed = false
                 shouldStopSpeaker = true
-                shouldCompleteActiveCycle = true
                 scheduleCaptureGateStaleFlushLocked(disabledAtMs)
             }
         }
@@ -781,17 +618,14 @@ class GlassesImagePipeline(private val context: Context) {
         if (shouldStopSpeaker) {
             speaker.stop()
         }
-        if (shouldCompleteActiveCycle) {
-            completeActiveCaptureCycle("CAPTURE_GATE_DISABLED")
-        }
 
         Log.i(TAG, "Capture gate ${if (enabled) "enabled" else "disabled"} (source=$source)")
     }
 
     /**
-        * Immediately cancel and drain in-flight capture work.
-        * Active coroutine work sees a new epoch and exits, and reassembly
-        * buffers are cleared so stale chunks get dropped.
+     * Immediately invalidate and drain in-flight capture work.
+     * Any active coroutine work will observe a new epoch and stop, and
+     * reassembly buffers are cleared so stale chunks are dropped.
      */
     fun abortInFlightCapture(reason: String = "APP_INTERRUPT") {
         synchronized(captureGateLock) {
@@ -816,27 +650,6 @@ class GlassesImagePipeline(private val context: Context) {
 
     fun isCaptureGateEnabled(): Boolean = captureGateEnabled
 
-    fun isProcessingInFlight(): Boolean = processingInFlight
-
-    fun isCapturePipelineBusy(): Boolean {
-        if (processingInFlight) return true
-        synchronized(captureCycleLock) {
-            expireStaleActiveCycleLocked(SystemClock.elapsedRealtime())
-            val cycle = activeCaptureCycle ?: return false
-            return shouldBlockCycleSupersedeLocked(cycle)
-        }
-    }
-
-    fun isCaptureActivityRecent(maxSilenceMs: Long = CAPTURE_ACTIVITY_RECENT_WINDOW_MS): Boolean {
-        if (!captureGateEnabled || maxSilenceMs <= 0L) return false
-
-        val lastSignalElapsedMs = maxOf(lastInferenceImageDataElapsedMs, lastCaptureCommandElapsedMs)
-        if (lastSignalElapsedMs <= 0L) return false
-
-        val silenceElapsedMs = (SystemClock.elapsedRealtime() - lastSignalElapsedMs).coerceAtLeast(0L)
-        return silenceElapsedMs <= maxSilenceMs
-    }
-
     private fun scheduleCaptureGateStaleFlushLocked(disabledAtMs: Long) {
         captureGateFlushJob?.cancel()
         captureGateFlushJob = scope.launch {
@@ -851,15 +664,13 @@ class GlassesImagePipeline(private val context: Context) {
         }
     }
 
-    private fun clearSingleReassemblyState() {
+    private fun clearReassemblyBuffersLocked(reason: String) {
         photoBuffer.reset()
         isReceiving = false
         expectedChunkIndex = 0
         totalBytesReceived = 0
         droppedChunks = 0
-    }
 
-    private fun clearBurstReassemblyState(reason: String? = null) {
         burstFrameBuffers.clear()
         burstFrameTimestamps.clear()
         burstFrameCaptureTimeHints.clear()
@@ -868,21 +679,6 @@ class GlassesImagePipeline(private val context: Context) {
         burstDroppedChunks = 0
         burstRequestStartedAtMs = 0L
         burstFirstFrameAtMs = null
-        burstReassemblyPinnedForPostProcess = false
-        if (reason != null) {
-            Log.d(TAG, "Burst reassembly state cleared ($reason)")
-        }
-    }
-
-    private fun clearInboundReassemblyAfterTransferAbort(reasonLabel: String) {
-        clearSingleReassemblyState()
-        clearBurstReassemblyState(reason = "transfer_abort:$reasonLabel")
-        isBurstMode = false
-    }
-
-    private fun clearReassemblyBuffersLocked(reason: String) {
-        clearSingleReassemblyState()
-        clearBurstReassemblyState(reason = "capture_buffer_reset:$reason")
         isBurstMode = false
 
         Log.i(TAG, "Capture buffers cleared ($reason)")
@@ -896,89 +692,16 @@ class GlassesImagePipeline(private val context: Context) {
         bitmaps.forEach { if (!it.isRecycled) it.recycle() }
     }
 
-    private fun activeCaptureCycleMode(): String? {
-        synchronized(captureCycleLock) {
-            return activeCaptureCycle?.mode
-        }
-    }
-
-    private fun handleSingleModeBurstMismatch(frameIndex: Int, dataSize: Int, reason: String) {
-        val nowElapsed = SystemClock.elapsedRealtime()
-        val elapsedSinceLastMismatch =
-            (nowElapsed - lastSingleModeBurstMismatchElapsedMs).coerceAtLeast(0L)
-        if (elapsedSinceLastMismatch < SINGLE_MODE_BURST_MISMATCH_COOLDOWN_MS) {
-            return
-        }
-        lastSingleModeBurstMismatchElapsedMs = nowElapsed
-
-        val activeMode = activeCaptureCycleMode() ?: "NONE"
-        val dropSnapshot = if (isBurstMode) burstDroppedChunks else droppedChunks
-
-        Log.w(
-            TAG,
-            "Burst payload received during SINGLE cycle; forcing parser recovery (reason=$reason, frameIndex=$frameIndex, size=$dataSize)"
-        )
-        InteractionLogger.logSessionEvidence(
-            "GLASSES_TRANSFER",
-            "BURST_IN_SINGLE_MISMATCH",
-            "reason=$reason;frame_index=$frameIndex;size=$dataSize;active_mode=$activeMode;burst_mode=${if (isBurstMode) 1 else 0};drop_count=$dropSnapshot"
-        )
-
-        markCycleTransferCompleted(
-            stageLabel = "SINGLE_MODE_MISMATCH",
-            frames = 0,
-            dropped = dropSnapshot
-        )
-        clearSingleReassemblyState()
-        clearBurstReassemblyState(reason = "single_mode_mismatch:$reason")
-        isBurstMode = false
-
-        if (activeMode == "SINGLE") {
-            completeActiveCaptureCycle("BURST_STREAM_IN_SINGLE_MODE")
-        }
-    }
-
-    private fun handleSingleModeBurstTakeover(data: ByteArray, frameIndex: Int) {
-        Log.w(
-            TAG,
-            "Burst chunk-0 received during SINGLE cycle; preempting SINGLE cycle and switching parser to burst mode"
-        )
-        InteractionLogger.logSessionEvidence(
-            "GLASSES_TRANSFER",
-            "BURST_TAKEOVER_FROM_SINGLE",
-            "frame_index=$frameIndex;size=${data.size};active_mode=SINGLE"
-        )
-
-        if (processingInFlight && !processingPreemptLatch) {
-            processingPreemptLatch = true
-            abortInFlightCapture(reason = "BURST_PREEMPT_SINGLE")
-        }
-
-        markCycleTransferCompleted(
-            stageLabel = "SINGLE_PREEMPTED_BY_BURST",
-            frames = 0,
-            dropped = droppedChunks
-        )
-        completeActiveCaptureCycle("SINGLE_PREEMPTED_BY_BURST")
-        prepareBurst()
-        handleBurstData(data, frameIndex)
-    }
-
-    // ── Incoming BLE data entry point ────────────────────────────────────────
+    // ── Incoming data entry point ─────────────────────────────────────────────
 
     /**
-        * Route one incoming BLE notification chunk.
-        * Called by [GlassesMessageHandler] on the BLE callback thread.
+     * Route an incoming BLE notification chunk.
+     * Called by [GlassesMessageHandler] from the BLE callback thread.
      */
     fun onBleData(data: ByteArray) {
         if (tryHandleCadenceHandoffFeedback(data)) return
-        if (tryHandleTransferAbortMarker(data)) return
         if (data.size < 2) return
         val frameIndex = (data[0].toInt() and 0xFF) or ((data[1].toInt() and 0xFF) shl 8)
-        val incomingProfile = incomingInferenceProfile(data, frameIndex)
-        val burstEndMarker = isBurstEndMarker(data)
-        val burstChunkZero = shouldAutoSwitchToBurst(data, frameIndex)
-        val activeCycleMode = activeCaptureCycleMode()
 
         if (!captureGateEnabled) {
             val disabledAt = captureGateDisabledAtMs
@@ -996,54 +719,14 @@ class GlassesImagePipeline(private val context: Context) {
             return
         }
 
-        if (burstReassemblyPinnedForPostProcess) {
-            Log.w(TAG, "Dropping inbound capture chunk while burst post-process is pinned")
-            return
-        }
-
-        lastInferenceImageDataElapsedMs = SystemClock.elapsedRealtime()
-        if (!detectorUpshiftPerInferenceEnabled) {
-            scheduleDetectorIdleUpshiftCheck(incomingProfile)
-        }
-
-        if (shouldPreemptForIncomingCapture(frameIndex, data)) {
-            processingPreemptLatch = true
-            abortInFlightCapture(reason = "INCOMING_CAPTURE_PRIORITY")
-        }
-
-        markCycleDataReceived()
-
-        if (activeCycleMode == "SINGLE") {
-            when {
-                isBurstMode -> {
-                    handleSingleModeBurstMismatch(
-                        frameIndex = frameIndex,
-                        dataSize = data.size,
-                        reason = "MODE_DESYNC"
-                    )
-                    return
-                }
-                burstEndMarker -> {
-                    handleSingleModeBurstMismatch(
-                        frameIndex = frameIndex,
-                        dataSize = data.size,
-                        reason = "BURST_END_MARKER"
-                    )
-                    return
-                }
-                burstChunkZero -> {
-                    handleSingleModeBurstTakeover(data = data, frameIndex = frameIndex)
-                    return
-                }
-            }
-        }
+        markCycleFirstDataIfNeeded()
 
         if (!isBurstMode) {
-            if (burstEndMarker) {
+            if (isBurstEndMarker(data)) {
                 Log.w(TAG, "Ignoring burst-end marker while in single-photo mode")
                 return
             }
-            if (burstChunkZero) {
+            if (shouldAutoSwitchToBurst(data, frameIndex)) {
                 Log.w(TAG, "Detected burst chunk while in single-photo mode; switching parser mode")
                 prepareBurst()
                 handleBurstData(data, frameIndex)
@@ -1055,59 +738,8 @@ class GlassesImagePipeline(private val context: Context) {
         else handleSinglePhotoData(data, frameIndex)
     }
 
-    private fun tryHandleTransferAbortMarker(data: ByteArray): Boolean {
-        if (data.size < 2) return false
-        if (data[0] != TRANSFER_ABORT_MARKER_LO || data[1] != TRANSFER_ABORT_MARKER_HI) return false
-
-        val reasonCode = if (data.size >= 3) {
-            data[2].toInt() and 0xFF
-        } else {
-            TRANSFER_ABORT_REASON_UNKNOWN
-        }
-        val reasonLabel = transferAbortReasonLabel(reasonCode)
-        val frameCount = if (isBurstMode) burstFrameBuffers.size else 1
-        val dropCount = if (isBurstMode) burstDroppedChunks else droppedChunks
-
-        Log.w(TAG, "Received transfer-abort marker from firmware (reason=$reasonLabel)")
-        InteractionLogger.logSessionEvidence(
-            "GLASSES_TRANSFER",
-            "TRANSFER_ABORT_MARKER",
-            "reason=$reasonLabel;burst_mode=${if (isBurstMode) 1 else 0};frames=$frameCount;drop_count=$dropCount"
-        )
-
-        markCycleTransferCompleted(
-            stageLabel = "TRANSFER_ABORT",
-            frames = frameCount,
-            dropped = dropCount
-        )
-        clearInboundReassemblyAfterTransferAbort(reasonLabel)
-        completeActiveCaptureCycle("TRANSFER_ABORT_$reasonLabel")
-        return true
-    }
-
-    private fun transferAbortReasonLabel(reasonCode: Int): String {
-        return when (reasonCode) {
-            TRANSFER_ABORT_REASON_CMD_SINGLE -> "CMD_SINGLE"
-            TRANSFER_ABORT_REASON_CMD_BURST -> "CMD_BURST"
-            TRANSFER_ABORT_REASON_CAPTURE_DISABLED -> "CAPTURE_DISABLED"
-            TRANSFER_ABORT_REASON_BUTTON_PRIORITY -> "BUTTON_PRIORITY"
-            TRANSFER_ABORT_REASON_RUNTIME_GUARD -> "RUNTIME_GUARD"
-            else -> "UNKNOWN_$reasonCode"
-        }
-    }
-
     private fun isBurstEndMarker(data: ByteArray): Boolean {
         return data.size == 2 && data[0] == 0xFE.toByte() && data[1] == 0xFF.toByte()
-    }
-
-    private fun incomingInferenceProfile(data: ByteArray, frameIndex: Int): InferenceProfile {
-        if (isBurstMode) {
-            return InferenceProfile.BURST
-        }
-        if (isBurstEndMarker(data) || shouldAutoSwitchToBurst(data, frameIndex)) {
-            return InferenceProfile.BURST
-        }
-        return InferenceProfile.SINGLE
     }
 
     private fun shouldAutoSwitchToBurst(data: ByteArray, frameIndex: Int): Boolean {
@@ -1127,28 +759,10 @@ class GlassesImagePipeline(private val context: Context) {
             data[offset + 2] == 0xFF.toByte()
     }
 
-    private fun shouldPreemptForIncomingCapture(frameIndex: Int, data: ByteArray): Boolean {
-        if (frameIndex != 0) return false
-        if (!processingInFlight || processingPreemptLatch) return false
-        if (!isPriorityBurstCycleActive()) return false
-
-        val hasLegacyBurstHeader = hasJpegHeaderAtOffset(data, 4)
-        val hasTimestampedBurstHeader = hasJpegHeaderAtOffset(data, 8)
-        return hasLegacyBurstHeader || hasTimestampedBurstHeader
-    }
-
-    private fun isPriorityBurstCycleActive(): Boolean {
-        synchronized(captureCycleLock) {
-            val cycle = activeCaptureCycle ?: return false
-            if (cycle.mode != "BURST") return false
-            return cycle.trigger == "INTERRUPT_RESTART"
-        }
-    }
-
-    // ── Single-photo reassembly ──────────────────────────────────────────────
+    // ── Single photo reassembly ───────────────────────────────────────────────
 
     private fun handleSinglePhotoData(data: ByteArray, frameIndex: Int) {
-        // End marker for single-photo mode: exact [0xFF, 0xFF].
+        // End marker: frameIndex == 0xFFFF and exact 2-byte payload [0xFF, 0xFF]
         if (frameIndex == 0xFFFF) {
             if (data.size != 2) {
                 Log.w(TAG, "Ignoring non-single end marker in single-photo mode (size=${data.size})")
@@ -1178,7 +792,7 @@ class GlassesImagePipeline(private val context: Context) {
             expectedChunkIndex = 0
             totalBytesReceived = 0
             droppedChunks = 0
-            // Chunk 0 payload starts after frameIndex(2) + orientation(1).
+            // Chunk 0: skip frameIndex(2) + orientation(1) = 3 bytes
             if (data.size > 3) {
                 photoBuffer.write(data, 3, data.size - 3)
                 totalBytesReceived += data.size - 3
@@ -1189,7 +803,7 @@ class GlassesImagePipeline(private val context: Context) {
                 droppedChunks += frameIndex - expectedChunkIndex
                 Log.w(TAG, "Dropped ${frameIndex - expectedChunkIndex} chunk(s)")
             }
-            // Chunk N payload starts after frameIndex(2).
+            // Chunk N: skip frameIndex(2)
             if (data.size > 2) {
                 photoBuffer.write(data, 2, data.size - 2)
                 totalBytesReceived += data.size - 2
@@ -1201,13 +815,13 @@ class GlassesImagePipeline(private val context: Context) {
     // ── Burst reassembly ──────────────────────────────────────────────────────
 
     private fun handleBurstData(data: ByteArray, frameIndex: Int) {
-        // End-of-burst marker.
+        // End-of-burst: [0xFE, 0xFF]
         if (data.size == 2 && data[0] == 0xFE.toByte() && data[1] == 0xFF.toByte()) {
             Log.d(TAG, "Burst complete: ${burstFrameBuffers.size} frames")
             processBurstFrames(System.currentTimeMillis())
             return
         }
-        // Per-frame end marker.
+        // Per-frame end: [0xFF, 0xFF, burstSeq]
         if (frameIndex == 0xFFFF && data.size == 3) {
             burstExpectedChunkIndex = 0
             return
@@ -1216,59 +830,33 @@ class GlassesImagePipeline(private val context: Context) {
 
         val burstSeq = data[2].toInt() and 0xFF
 
-        if (frameIndex == 0) {
-            if (burstFrameBuffers.containsKey(burstSeq)) {
-                InteractionLogger.logSessionEvidence(
-                    "GLASSES_TRANSFER",
-                    "BURST_FRAME_RESET",
-                    "seq=$burstSeq;reason=CHUNK0_RESTART"
-                )
-            }
+        if (frameIndex == 0 && burstSeq != currentBurstSeq) {
             currentBurstSeq = burstSeq
-            val frameBuffer = ByteArrayOutputStream()
-            burstFrameBuffers[burstSeq] = frameBuffer
+            burstFrameBuffers[burstSeq] = ByteArrayOutputStream()
             val now = System.currentTimeMillis()
             burstFrameTimestamps[burstSeq] = now
-            burstFrameCaptureTimeHints.remove(burstSeq)
             BurstChunkHeaderPolicy.captureTimeMs(data)?.let { captureTime ->
                 burstFrameCaptureTimeHints[burstSeq] = captureTime
             }
             if (burstFirstFrameAtMs == null) burstFirstFrameAtMs = now
             burstExpectedChunkIndex = 0
+        }
 
+        val buf = burstFrameBuffers[burstSeq] ?: return
+
+        if (frameIndex == 0) {
             val payloadOffset = BurstChunkHeaderPolicy.payloadOffset(data)
             if (data.size > payloadOffset) {
-                frameBuffer.write(data, payloadOffset, data.size - payloadOffset)
+                buf.write(data, payloadOffset, data.size - payloadOffset)
                 totalBytesReceived += data.size - payloadOffset
             }
             burstExpectedChunkIndex = 1
-            return
+        } else {
+            if (frameIndex != burstExpectedChunkIndex) burstDroppedChunks += frameIndex - burstExpectedChunkIndex
+            // Skip frameIndex(2) + burstSeq(1) = 3 bytes
+            if (data.size > 3) { buf.write(data, 3, data.size - 3); totalBytesReceived += data.size - 3 }
+            burstExpectedChunkIndex = frameIndex + 1
         }
-
-        val buf = burstFrameBuffers[burstSeq] ?: run {
-            burstDroppedChunks += 1
-            Log.w(TAG, "Dropping burst chunk without frame start (seq=$burstSeq, chunk=$frameIndex)")
-            return
-        }
-
-        if (frameIndex != burstExpectedChunkIndex) {
-            val missingChunks = frameIndex - burstExpectedChunkIndex
-            if (missingChunks > 0) {
-                burstDroppedChunks += missingChunks
-                Log.w(TAG, "Dropped $missingChunks burst chunk(s) for seq=$burstSeq")
-            } else {
-                Log.w(
-                    TAG,
-                    "Out-of-order burst chunk for seq=$burstSeq (chunk=$frameIndex expected=$burstExpectedChunkIndex)"
-                )
-            }
-        }
-        // Payload starts after frameIndex(2) + burstSeq(1).
-        if (data.size > 3) {
-            buf.write(data, 3, data.size - 3)
-            totalBytesReceived += data.size - 3
-        }
-        burstExpectedChunkIndex = frameIndex + 1
     }
 
     private fun processBurstFrames(burstCompletedAtMs: Long) {
@@ -1343,13 +931,10 @@ class GlassesImagePipeline(private val context: Context) {
             dropped = burstDroppedChunks
         )
 
-        isBurstMode = false
-        burstReassemblyPinnedForPostProcess = frames.isNotEmpty()
-        if (frames.isNotEmpty()) {
-            processFrames(frames, timestamps)
-        } else {
-            clearBurstReassemblyState(reason = "burst_complete_empty")
-        }
+        burstFrameBuffers.clear()
+        burstFrameTimestamps.clear()
+        burstFrameCaptureTimeHints.clear()
+        if (frames.isNotEmpty()) processFrames(frames, timestamps)
     }
 
     private fun updateBurstTimingAggregate(stats: BurstTimingStats): BurstTimingAggregateStats {
@@ -1546,14 +1131,10 @@ class GlassesImagePipeline(private val context: Context) {
         context.sendBroadcast(intent)
     }
 
-    // ── Detection/inference pipeline ─────────────────────────────────────────
+    // ── Detection pipeline ────────────────────────────────────────────────────
 
     private fun processFrames(frames: List<ByteArray>, timestamps: List<Long>) {
         scope.launch {
-            processingInFlight = true
-            var inferenceDetector: ObjectDetector? = null
-            var didRunDetection = false
-            var inferenceProfile = InferenceProfile.SINGLE
             try {
                 data class DecodedFrame(val bitmap: Bitmap, val timestampMs: Long)
 
@@ -1595,7 +1176,7 @@ class GlassesImagePipeline(private val context: Context) {
 
                 val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
 
-                // Save raw frames first.
+                // Save raw frames
                 validFrames.forEachIndexed { i, jpeg ->
                     saveJpeg(jpeg, "ESP32_${ts}_frame$i.jpg")
                 }
@@ -1603,7 +1184,7 @@ class GlassesImagePipeline(private val context: Context) {
                 val detector = objectDetector
                 if (detector == null) {
                     Log.w(TAG, "ObjectDetector not ready — skipping inference")
-                    // Detector is not ready yet, but still persist and broadcast save.
+                    // Still save and broadcast image saved
                     imageStorage.saveImage(validFrames.last())?.let { uri ->
                         context.sendBroadcast(android.content.Intent("GLASSES_IMAGE_SAVED").apply {
                             putExtra("uri", uri.toString())
@@ -1613,7 +1194,6 @@ class GlassesImagePipeline(private val context: Context) {
                     completeActiveCaptureCycle("DETECTOR_NOT_READY")
                     return@launch
                 }
-                inferenceDetector = detector
 
                 val decodedFrames = validFrames.mapIndexedNotNull { idx, jpeg ->
                     val bitmap = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
@@ -1630,7 +1210,7 @@ class GlassesImagePipeline(private val context: Context) {
                     return@launch
                 }
 
-                // Keep only frames with matching dimensions (same assumption as MainActivity).
+                // Consistent dimensions (from glasses MainActivity)
                 val refW = decodedFrames.first().bitmap.width
                 val refH = decodedFrames.first().bitmap.height
                 val consistentFrames = decodedFrames.filter { frame ->
@@ -1659,22 +1239,8 @@ class GlassesImagePipeline(private val context: Context) {
                     return@launch
                 }
 
-                inferenceProfile = profileForFrameCount(consistentBitmaps.size)
-                lastInferenceProfile = inferenceProfile
-
-                // Run YOLO on each frame.
-                val detectionStartedAtMs = SystemClock.elapsedRealtime()
+                // YOLO on each frame
                 val frameDetections = consistentBitmaps.map { detector.detect(it) }
-                val detectionLatencyMs =
-                    (SystemClock.elapsedRealtime() - detectionStartedAtMs).coerceAtLeast(0L)
-                didRunDetection = true
-
-                maybeDownshiftDetectorModelForLatency(
-                    detector = detector,
-                    frameCount = consistentBitmaps.size,
-                    detectionLatencyMs = detectionLatencyMs,
-                    profile = inferenceProfile
-                )
 
                 if (shouldAbortCaptureProcessing(gateEpochSnapshot)) {
                     recycleBitmaps(consistentBitmaps)
@@ -1685,19 +1251,15 @@ class GlassesImagePipeline(private val context: Context) {
                 }
 
                 // Estimate camera ego-motion from sparse background features
-                // so relative object motion is more stable.
-                val sparseEstimate = if (SparseBackgroundTracker.isNativeAvailable()) {
-                    runCatching {
-                        SparseBackgroundTracker.estimateCameraVelocity(
-                            bitmaps = consistentBitmaps,
-                            frameDetections = frameDetections,
-                            frameTimestamps = consistentTimestamps
-                        )
-                    }.getOrElse { error ->
-                        Log.w(TAG, "Sparse background ego-motion estimate failed: ${error.message}")
-                        null
-                    }
-                } else {
+                // to improve relative object-motion derivation.
+                val sparseEstimate = runCatching {
+                    SparseBackgroundTracker.estimateCameraVelocity(
+                        bitmaps = consistentBitmaps,
+                        frameDetections = frameDetections,
+                        frameTimestamps = consistentTimestamps
+                    )
+                }.getOrElse { error ->
+                    Log.w(TAG, "Sparse background ego-motion estimate failed: ${error.message}")
                     null
                 }
 
@@ -1710,7 +1272,7 @@ class GlassesImagePipeline(private val context: Context) {
                     )
                 }
 
-                // Motion tracking stage.
+                // Motion tracking
                 val tracked = motionTracker?.analyzeMotion(
                     frameDetections,
                     consistentTimestamps,
@@ -1728,7 +1290,7 @@ class GlassesImagePipeline(private val context: Context) {
                         )
                     }.orEmpty()
 
-                // Distance estimation stage.
+                // Distance estimation
                 val distances = mutableMapOf<Int, DistanceEstimator.DistanceResult>()
                 distanceEstimator?.let { est ->
                     est.frameWidth  = refW.toFloat()
@@ -1738,12 +1300,12 @@ class GlassesImagePipeline(private val context: Context) {
                     }
                 }
 
-                // Fuse distance info into threat levels.
+                // Fuse distance into threat levels
                 val fused = if (distances.isNotEmpty())
                     motionTracker?.fuseDistance(tracked, distances) ?: tracked
                 else tracked
 
-                // Annotate and save.
+                // Annotate + save
                 imageAnnotator?.let { ann ->
                     if (fused.isNotEmpty()) {
                         val annotated = ann.annotate(consistentBitmaps.last(), fused, distances)
@@ -1752,7 +1314,7 @@ class GlassesImagePipeline(private val context: Context) {
                     }
                 }
 
-                // Save to app gallery through ImageStorageManager.
+                // Save to app gallery via ImageStorageManager
                 val retentionHint = buildRetentionHint(fused, distances)
                 imageStorage.saveImage(consistentBitmaps.last().let {
                     val out = ByteArrayOutputStream()
@@ -1765,7 +1327,7 @@ class GlassesImagePipeline(private val context: Context) {
                     ObjectHistory.addDetection("[Glasses] Image saved")
                 }
 
-                // Convert to DetectionSpeaker.Detection and speak.
+                // Convert to DetectionSpeaker.Detection and speak
                 val speechDetections = fused.mapIndexed { i, det ->
                     val dist = distances[i]
                     DetectionSpeaker.Detection(
@@ -1785,10 +1347,7 @@ class GlassesImagePipeline(private val context: Context) {
                         completeActiveCaptureCycle("CAPTURE_GATE_ABORT_PRE_TTS")
                     } else if (AssistiveRuntimeSettings.isAssistiveSpeechAllowed(context)) {
                         markInferenceCompletedIfNeeded()
-                        val utteranceId = speaker.speak(
-                            detections = speechDetections,
-                            interruptInFlight = shouldInterruptSpeechForThreat(speechDetections)
-                        )
+                        val utteranceId = speaker.speak(speechDetections)
                         if (utteranceId != null) {
                             markTtsQueued(utteranceId)
                         } else {
@@ -1799,7 +1358,7 @@ class GlassesImagePipeline(private val context: Context) {
                         markInferenceCompletedIfNeeded()
                         completeActiveCaptureCycle("SPEECH_SKIPPED")
                     }
-                    // Broadcast a summary so the UI log can show it.
+                    // Broadcast summary for UI log
                     if (!shouldAbortCaptureProcessing(gateEpochSnapshot)) {
                         val summary = buildDetectionSummary(fused, distances)
                         context.sendBroadcast(android.content.Intent("GLASSES_DETECTION_SUMMARY").apply {
@@ -1814,17 +1373,11 @@ class GlassesImagePipeline(private val context: Context) {
                 Log.e(TAG, "Detection pipeline error: ${e.message}", e)
                 markInferenceCompletedIfNeeded()
                 completeActiveCaptureCycle("PIPELINE_ERROR")
-            } finally {
-                if (didRunDetection && inferenceDetector != null) {
-                    maybeReselectHighestModelAfterInference(inferenceDetector, inferenceProfile)
-                }
-                processingInFlight = false
-                processingPreemptLatch = false
             }
         }
     }
 
-    // ── Enum mappers: MotionTracker -> DetectionSpeaker ─────────────────────
+    // ── Type mappers: glasses enums → DetectionSpeaker enums ─────────────────
 
     private fun mapMotionState(ms: MotionTracker.MotionState) = when (ms) {
         MotionTracker.MotionState.APPROACHING     -> DetectionSpeaker.MotionState.APPROACHING
@@ -1841,17 +1394,6 @@ class GlassesImagePipeline(private val context: Context) {
         MotionTracker.ThreatLevel.MODERATE -> DetectionSpeaker.ThreatLevel.MODERATE
         MotionTracker.ThreatLevel.LOW      -> DetectionSpeaker.ThreatLevel.LOW
         else                               -> DetectionSpeaker.ThreatLevel.UNKNOWN
-    }
-
-    private fun shouldInterruptSpeechForThreat(
-        detections: List<DetectionSpeaker.Detection>
-    ): Boolean {
-        return detections.any {
-            (it.threatLevel == DetectionSpeaker.ThreatLevel.CRITICAL ||
-                it.threatLevel == DetectionSpeaker.ThreatLevel.HIGH) &&
-                it.motionState != DetectionSpeaker.MotionState.UNKNOWN &&
-                it.motionState != DetectionSpeaker.MotionState.STATIONARY
-        }
     }
 
     private fun buildRetentionHint(
@@ -1881,258 +1423,7 @@ class GlassesImagePipeline(private val context: Context) {
         )
     }
 
-    private fun profileForFrameCount(frameCount: Int): InferenceProfile {
-        return if (frameCount > 1) {
-            InferenceProfile.BURST
-        } else {
-            InferenceProfile.SINGLE
-        }
-    }
-
-    private fun downshiftPathForProfile(profile: InferenceProfile): List<String> {
-        return when (profile) {
-            InferenceProfile.BURST -> DETECTOR_MODEL_BURST_DOWNSHIFT_PATH
-            InferenceProfile.SINGLE -> DETECTOR_MODEL_SINGLE_DOWNSHIFT_PATH
-        }
-    }
-
-    private fun preferredAssetForProfile(profile: InferenceProfile): String {
-        return downshiftPathForProfile(profile).firstOrNull() ?: DETECTOR_MODEL_SINGLE_TOP
-    }
-
-    private fun ensurePreferredModelForProfile(
-        detector: ObjectDetector,
-        profile: InferenceProfile,
-        trigger: String
-    ) {
-        if (!detectorModelAutoSwapEnabled) return
-
-        val preferredAsset = preferredAssetForProfile(profile)
-
-        synchronized(detectorModelSwapLock) {
-            val currentAsset = detector.getActiveModelAsset()
-            if (currentAsset == preferredAsset) {
-                return
-            }
-
-            val swapStartedAtMs = SystemClock.elapsedRealtime()
-            val activeBackend = detector.setConfig(
-                ObjectDetector.Config(
-                    backend = detectorBackendPreference,
-                    onnxModelAsset = preferredAsset
-                )
-            )
-            val swapDurationMs =
-                (SystemClock.elapsedRealtime() - swapStartedAtMs).coerceAtLeast(0L)
-            val appliedAsset = detector.getActiveModelAsset()
-
-            if (appliedAsset == currentAsset) {
-                return
-            }
-
-            InteractionLogger.logSessionEvidence(
-                "GLASSES_MODEL_SWAP",
-                "PROFILE_ALIGN",
-                "profile=${profile.name};trigger=$trigger;from=$currentAsset;requested=$preferredAsset;applied=$appliedAsset;swap_ms=$swapDurationMs;backend=${activeBackend.name}"
-            )
-            Log.i(
-                TAG,
-                "Detector profile align applied ($trigger/${profile.name}): $currentAsset -> $appliedAsset (swap=${swapDurationMs}ms)"
-            )
-        }
-    }
-
-    private fun maybeDownshiftDetectorModelForLatency(
-        detector: ObjectDetector,
-        frameCount: Int,
-        detectionLatencyMs: Long,
-        profile: InferenceProfile
-    ) {
-        if (!detectorModelAutoSwapEnabled) return
-        if (detectionLatencyMs < DETECTOR_BURST_DOWNSHIFT_THRESHOLD_MS) return
-
-        val downshiftPath = downshiftPathForProfile(profile)
-
-        synchronized(detectorModelSwapLock) {
-            val nowMs = System.currentTimeMillis()
-            if (nowMs - lastDetectorModelSwapAtMs < DETECTOR_MODEL_SWAP_COOLDOWN_MS) {
-                return
-            }
-
-            val currentAsset = detector.getActiveModelAsset()
-            val currentIndex = downshiftPath.indexOf(currentAsset)
-            if (currentIndex < 0 || currentIndex >= downshiftPath.lastIndex) {
-                return
-            }
-
-            val requestedAsset = downshiftPath[currentIndex + 1]
-            val swapStartedAtMs = SystemClock.elapsedRealtime()
-            val activeBackend = detector.setConfig(
-                ObjectDetector.Config(
-                    backend = detectorBackendPreference,
-                    onnxModelAsset = requestedAsset
-                )
-            )
-            val swapDurationMs =
-                (SystemClock.elapsedRealtime() - swapStartedAtMs).coerceAtLeast(0L)
-
-            val appliedAsset = detector.getActiveModelAsset()
-            if (appliedAsset == currentAsset) {
-                return
-            }
-
-            lastDetectorModelSwapAtMs = nowMs
-            InteractionLogger.logSessionEvidence(
-                "GLASSES_MODEL_SWAP",
-                "AUTO_DOWNSHIFT",
-                "profile=${profile.name};from=$currentAsset;requested=$requestedAsset;applied=$appliedAsset;latency_ms=$detectionLatencyMs;swap_ms=$swapDurationMs;frames=$frameCount;backend=${activeBackend.name}"
-            )
-            Log.i(
-                TAG,
-                "Detector auto-downshift applied (${profile.name}): $currentAsset -> $appliedAsset (latency=${detectionLatencyMs}ms, swap=${swapDurationMs}ms, frames=$frameCount)"
-            )
-        }
-    }
-
-    private data class DetectorModelSwapResult(
-        val fromAsset: String,
-        val toAsset: String,
-        val swapDurationMs: Long,
-        val backend: ObjectDetector.Backend
-    )
-
-    private fun maybeReselectHighestModelAfterInference(
-        detector: ObjectDetector,
-        profile: InferenceProfile
-    ) {
-        if (!detectorModelAutoSwapEnabled) return
-
-        if (detectorUpshiftPerInferenceEnabled) {
-            val result = tryUpshiftDetectorModel(
-                detector = detector,
-                trigger = "POST_INFERENCE",
-                profile = profile
-            )
-
-            if (result != null && result.swapDurationMs > DETECTOR_UPSHIFT_SIGNIFICANT_DELAY_MS) {
-                detectorUpshiftPerInferenceEnabled = false
-                InteractionLogger.logSessionEvidence(
-                    "GLASSES_MODEL_SWAP",
-                    "AUTO_UPSHIFT_POLICY_FALLBACK",
-                    "swap_ms=${result.swapDurationMs};threshold_ms=$DETECTOR_UPSHIFT_SIGNIFICANT_DELAY_MS;from=${result.fromAsset};to=${result.toAsset}"
-                )
-                Log.w(
-                    TAG,
-                    "Detector upshift swap took ${result.swapDurationMs}ms (> ${DETECTOR_UPSHIFT_SIGNIFICANT_DELAY_MS}ms); switching to idle-upshift fallback"
-                )
-                scheduleDetectorIdleUpshiftCheck(profile)
-            }
-            return
-        }
-
-        scheduleDetectorIdleUpshiftCheck(profile)
-    }
-
-    private fun scheduleDetectorIdleUpshiftCheck(
-        preferredProfile: InferenceProfile = lastInferenceProfile
-    ) {
-        if (!detectorModelAutoSwapEnabled) return
-        if (detectorUpshiftPerInferenceEnabled) return
-        if (lastInferenceImageDataElapsedMs <= 0L) return
-
-        detectorIdleUpshiftJob?.cancel()
-        val idleProfile = preferredProfile
-        detectorIdleUpshiftJob = scope.launch {
-            while (true) {
-                val idleForMs =
-                    (SystemClock.elapsedRealtime() - lastInferenceImageDataElapsedMs).coerceAtLeast(0L)
-                val remainingMs = DETECTOR_IDLE_UPSHIFT_DELAY_MS - idleForMs
-                if (remainingMs > 0L) {
-                    delay(remainingMs)
-                    continue
-                }
-                if (processingInFlight) {
-                    delay(DETECTOR_IDLE_UPSHIFT_POLL_MS)
-                    continue
-                }
-                break
-            }
-
-            val detector = objectDetector ?: return@launch
-            val result = tryUpshiftDetectorModel(
-                detector = detector,
-                trigger = "IDLE_NO_IMAGE",
-                profile = idleProfile
-            )
-
-            if (result != null && result.swapDurationMs <= DETECTOR_UPSHIFT_SIGNIFICANT_DELAY_MS) {
-                detectorUpshiftPerInferenceEnabled = true
-                InteractionLogger.logSessionEvidence(
-                    "GLASSES_MODEL_SWAP",
-                    "AUTO_UPSHIFT_POLICY_RESTORED",
-                    "swap_ms=${result.swapDurationMs};threshold_ms=$DETECTOR_UPSHIFT_SIGNIFICANT_DELAY_MS;from=${result.fromAsset};to=${result.toAsset}"
-                )
-                Log.i(
-                    TAG,
-                    "Detector upshift policy restored to per-inference mode (idle swap=${result.swapDurationMs}ms)"
-                )
-            }
-        }
-    }
-
-    private fun tryUpshiftDetectorModel(
-        detector: ObjectDetector,
-        trigger: String,
-        profile: InferenceProfile
-    ): DetectorModelSwapResult? {
-        val preferredAsset = preferredAssetForProfile(profile)
-
-        synchronized(detectorModelSwapLock) {
-            val currentAsset = detector.getActiveModelAsset()
-            if (currentAsset == preferredAsset) {
-                return null
-            }
-
-            val swapStartedAtMs = SystemClock.elapsedRealtime()
-            val activeBackend = detector.setConfig(
-                ObjectDetector.Config(
-                    backend = detectorBackendPreference,
-                    onnxModelAsset = preferredAsset
-                )
-            )
-            val swapDurationMs =
-                (SystemClock.elapsedRealtime() - swapStartedAtMs).coerceAtLeast(0L)
-            val appliedAsset = detector.getActiveModelAsset()
-
-            if (appliedAsset == currentAsset) {
-                Log.w(
-                    TAG,
-                    "Detector upshift requested but model did not change (trigger=$trigger, profile=${profile.name}, current=$currentAsset, requested=$preferredAsset)"
-                )
-                return null
-            }
-
-            lastDetectorModelSwapAtMs = System.currentTimeMillis()
-            InteractionLogger.logSessionEvidence(
-                "GLASSES_MODEL_SWAP",
-                "AUTO_UPSHIFT",
-                "trigger=$trigger;profile=${profile.name};from=$currentAsset;requested=$preferredAsset;applied=$appliedAsset;swap_ms=$swapDurationMs;backend=${activeBackend.name}"
-            )
-            Log.i(
-                TAG,
-                "Detector auto-upshift applied ($trigger/${profile.name}): $currentAsset -> $appliedAsset (swap=${swapDurationMs}ms)"
-            )
-
-            return DetectorModelSwapResult(
-                fromAsset = currentAsset,
-                toAsset = appliedAsset,
-                swapDurationMs = swapDurationMs,
-                backend = activeBackend
-            )
-        }
-    }
-
-    // ── JPEG validation (same assumptions as glasses MainActivity) ───────────
+    // ── JPEG validation (from glasses MainActivity) ───────────────────────────
 
     private fun validateJpeg(data: ByteArray): Boolean {
         if (data.size < 4) return false
@@ -2140,7 +1431,7 @@ class GlassesImagePipeline(private val context: Context) {
             Log.e(TAG, "Invalid JPEG header: ${data.take(4).joinToString { "%02X".format(it) }}")
             return false
         }
-        // Warn if FFD9 end marker is missing (usually means truncated transfer).
+        // Warn on missing FFD9 end-of-image marker (truncated transfer)
         val last = data.size - 1
         if (data[last - 1] != 0xFF.toByte() || data[last] != 0xD9.toByte()) {
             Log.w(TAG, "JPEG missing FFD9 trailer — frame may be truncated (${data.size} bytes)")
@@ -2148,12 +1439,12 @@ class GlassesImagePipeline(private val context: Context) {
         return true
     }
 
-    // ── File saving helpers ──────────────────────────────────────────────────
+    // ── File saving ───────────────────────────────────────────────────────────
 
     private fun saveJpeg(bytes: ByteArray, filename: String) {
         try {
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-                // API 29+: use MediaStore (scoped storage path).
+                // API 29+: use MediaStore (scoped storage)
                 val values = android.content.ContentValues().apply {
                     put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, filename)
                     put(android.provider.MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
@@ -2215,7 +1506,7 @@ class GlassesImagePipeline(private val context: Context) {
         }
     }
 
-    // ── Summary builder for UI/log ───────────────────────────────────────────
+    // ── Summary for log ───────────────────────────────────────────────────────
 
     private fun buildDetectionSummary(
         detections: List<MotionTracker.TrackedDetection>,
@@ -2228,12 +1519,10 @@ class GlassesImagePipeline(private val context: Context) {
         }.joinToString(", ")
     }
 
-    // ── Lifecycle cleanup ────────────────────────────────────────────────────
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     fun close() {
         completeActiveCaptureCycle("PIPELINE_CLOSED")
-        detectorIdleUpshiftJob?.cancel()
-        detectorIdleUpshiftJob = null
         scope.cancel()
         speaker.setTelemetryListener(null)
         speaker.close()
