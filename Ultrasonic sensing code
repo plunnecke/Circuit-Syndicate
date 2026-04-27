@@ -291,7 +291,7 @@ void app_main(void) {
         } 
 
  
-
+//Battery level monitoring//
 
         uint16_t soc_raw = 0; 
 
